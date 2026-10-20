@@ -1,110 +1,23 @@
 import { describe, expect, it } from "vitest";
 import { computeEdgeProfile, detectGap } from "../edges";
 import { GapScanner } from "../scanner";
-import type { GrayFrame, RGBAImage } from "../types";
-
-// --- Synthetic world -------------------------------------------------------
-
-function hash(x: number, y: number): number {
-  let h = (x * 374761393 + y * 668265263) | 0;
-  h = Math.imul(h ^ (h >>> 13), 1274126177);
-  return ((h ^ (h >>> 16)) >>> 0) / 4294967295;
-}
-
-function noise(x: number, y: number): number {
-  const xi = Math.floor(x);
-  const yi = Math.floor(y);
-  const tx = x - xi;
-  const ty = y - yi;
-  const sx = tx * tx * (3 - 2 * tx);
-  const sy = ty * ty * (3 - 2 * ty);
-  const a = hash(xi, yi);
-  const b = hash(xi + 1, yi);
-  const c = hash(xi, yi + 1);
-  const d = hash(xi + 1, yi + 1);
-  return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy - 0.5;
-}
-
-/** The hidden scene, in its own coordinates. */
-const scene = (u: number, v: number) => 120 + 150 * noise(u / 9, v / 9) + 70 * noise(u / 3.5 + 50, v / 3.5) + 15 * Math.sin(u / 23);
-/** A light, grainy fence board. */
-const fence = (x: number, y: number) => 190 + 25 * noise(x / 5 + 300, y / 60);
-
-const W = 320;
-const H = 240;
-const SLIT = 36;
-const K_NEAR = 1;
-const K_FAR = 0.3;
-
-interface Pose {
-  occShift: number;
-  bgShift: number;
-  dy: number;
-}
-
-/**
- * The camera slides by T while turning to keep the gap roughly centred (as a
- * person does). Turning moves both layers equally; sliding moves the near
- * fence more than the far scene.
- */
-function pose(t: number): Pose {
-  const T = 140 * Math.sin((t / 120) * Math.PI);
-  const turn = -0.8 * K_NEAR * T;
-  return { occShift: K_NEAR * T + turn, bgShift: K_FAR * T + turn, dy: 1.5 * Math.sin(t * 0.21) };
-}
-
-/** Fence with dark board seams: strong vertical lines that compete with the gap's edges. */
-const seamedFence = (x: number, y: number) => {
-  const m = (((x - 7) % 41) + 41) % 41;
-  return m < 1.5 ? 110 : fence(x, y);
-};
-
-function render(p: Pose, t = 0, noiseAmp = 0, gain = 1, occluder = fence, slit = SLIT): GrayFrame {
-  const data = new Float32Array(W * H);
-  const s0 = W / 2 - slit / 2;
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const xo = x + p.occShift;
-      const inSlit = xo >= s0 && xo < s0 + slit;
-      const v = inSlit ? scene(x + p.bgShift, y + p.dy) : occluder(xo, y);
-      data[y * W + x] = Math.max(0, Math.min(255, v * gain + noiseAmp * (hash(x + t * 977, y) - 0.5)));
-    }
-  }
-  return { data, width: W, height: H };
-}
-
-function toRGBA(f: GrayFrame): RGBAImage {
-  const d = new Uint8ClampedArray(f.width * f.height * 4);
-  for (let i = 0; i < f.data.length; i++) {
-    d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = f.data[i];
-    d[i * 4 + 3] = 255;
-  }
-  return { data: d, width: f.width, height: f.height };
-}
-
-function crop(img: RGBAImage, sx0: number, sx1: number): RGBAImage {
-  const w = sx1 - sx0;
-  const out = new Uint8ClampedArray(w * img.height * 4);
-  for (let y = 0; y < img.height; y++) {
-    out.set(img.data.subarray((y * img.width + sx0) * 4, (y * img.width + sx1) * 4), y * w * 4);
-  }
-  return { data: out, width: w, height: img.height };
-}
-
-function ncc(a: number[], b: number[]): number {
-  const n = a.length;
-  const ma = a.reduce((s, v) => s + v, 0) / n;
-  const mb = b.reduce((s, v) => s + v, 0) / n;
-  let cov = 0;
-  let va = 0;
-  let vb = 0;
-  for (let i = 0; i < n; i++) {
-    cov += (a[i] - ma) * (b[i] - mb);
-    va += (a[i] - ma) ** 2;
-    vb += (b[i] - mb) ** 2;
-  }
-  return cov / Math.sqrt(va * vb);
-}
+import {
+  crop,
+  fence,
+  H,
+  ncc,
+  noise,
+  pose,
+  render,
+  renderWorld,
+  scene,
+  seamedFence,
+  SLIT,
+  toRGBA,
+  W,
+  type Pose,
+  type WorldOptions,
+} from "./synthetic";
 
 // --- Tests ------------------------------------------------------------------
 
@@ -283,3 +196,61 @@ describe("recording trigger", () => {
     expect(det.quality).toBeGreaterThan(0.6);
   });
 });
+
+describe("telling real gaps from look-alikes", () => {
+  const STRIP = { offset: 0, width: 40 };
+  const OPENING = { offset: 85, width: 36 };
+
+  /** Runs a sequence; returns per-frame [gap centre in wall coords | null, recorded this frame]. */
+  const run = (scanner: GapScanner, world: WorldOptions, frames: number, still = false) => {
+    const log: { centre: number | null; recorded: boolean }[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const I = scanner as any;
+    for (let t = 0; t < frames; t++) {
+      const p = still ? pose(0) : pose(t);
+      const frame = renderWorld(p, { ...world, t, noiseAmp: 8 });
+      const rgba = toRGBA(frame);
+      const before = I.framesUsed;
+      scanner.processFrame(frame, (a, b) => crop(rgba, a, b));
+      const g = scanner.gap;
+      log.push({
+        centre: g ? (g.left + g.right) / 2 + 0.5 + p.occShift - W / 2 : null,
+        recorded: I.framesUsed > before,
+      });
+    }
+    return log;
+  };
+  const near = (c: number | null, o: { offset: number }) => c !== null && Math.abs(c - o.offset) < 8;
+
+  it("prefers a real opening over a full-height strip on the wall, once the device slides", () => {
+    const scanner = new GapScanner({ width: W, height: H, colorScale: 1 });
+    const log = run(scanner, { slits: [OPENING], objects: [STRIP] }, 150);
+    // Never records the strip on the wall…
+    expect(log.filter((l) => l.recorded && near(l.centre, STRIP)).length).toBe(0);
+    // …ends up on the real opening, and records it.
+    expect(near(log[log.length - 1].centre, OPENING)).toBe(true);
+    expect(log.filter((l) => l.recorded && near(l.centre, OPENING)).length).toBeGreaterThan(60);
+  });
+
+  it("never records a gap look-alike on the wall, even while sliding", () => {
+    const scanner = new GapScanner({ width: W, height: H, colorScale: 1 });
+    const log = run(scanner, { objects: [STRIP] }, 150);
+    expect(log.filter((l) => l.recorded).length).toBe(0);
+    expect(scanner.getStatus().parallaxConfirmed).toBe(false);
+  });
+
+  it("standing still, prefers a full-height opening over a shorter rectangle", () => {
+    const scanner = new GapScanner({ width: W, height: H, colorScale: 1, requireParallax: false });
+    const log = run(scanner, { slits: [OPENING], objects: [{ ...STRIP, top: 0.25, bottom: 0.75 }] }, 40, true);
+    expect(near(log[log.length - 1].centre, OPENING)).toBe(true);
+  });
+
+  it("waits for the device to slide before recording a real opening", () => {
+    const scanner = new GapScanner({ width: W, height: H, colorScale: 1 });
+    const still = run(scanner, { slits: [OPENING] }, 40, true);
+    expect(scanner.phase).toBe("tracking");
+    expect(still.filter((l) => l.recorded).length).toBe(0);
+    expect(scanner.getStatus().awaitingParallax).toBe(true);
+  });
+});
+

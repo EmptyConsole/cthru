@@ -141,6 +141,33 @@ function drawFence(): HTMLCanvasElement {
     g.fill();
   }
 
+  // Decoys: things fixed to the fence that look like gaps in a still image.
+  // A full-height poster strip, and a shorter sign. They move with the fence,
+  // so sliding shows they're not openings.
+  const poster = (x: number, y: number, w: number, h: number, hue: number, label: string) => {
+    const grad = g.createLinearGradient(0, y, 0, y + h);
+    grad.addColorStop(0, `hsl(${hue} 70% 35%)`);
+    grad.addColorStop(0.5, `hsl(${hue + 40} 80% 60%)`);
+    grad.addColorStop(1, `hsl(${hue + 80} 60% 25%)`);
+    g.fillStyle = grad;
+    g.fillRect(x, y, w, h);
+    for (let i = 0; i < 40; i++) {
+      g.fillStyle = `hsla(${hue + rand() * 120} 80% ${30 + rand() * 50}% / 0.8)`;
+      g.fillRect(x + rand() * (w - 16), y + rand() * (h - 16), 6 + rand() * 12, 6 + rand() * 12);
+    }
+    g.save();
+    g.translate(x + w / 2, y + h / 2);
+    g.rotate(-Math.PI / 2);
+    g.font = `bold ${Math.round(w * 0.55)}px system-ui, sans-serif`;
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    g.fillStyle = "#f8fafc";
+    g.fillText(label, 0, 0);
+    g.restore();
+  };
+  poster(FENCE_W / 2 + 230, 0, 80, c.height, 300, "POSTER");
+  poster(FENCE_W / 2 - 300, c.height * 0.3, 70, c.height * 0.4, 190, "SIGN");
+
   // The slit: cut it out, with a little shadow on the inner edges.
   const sx = FENCE_W / 2 - SLIT_W / 2;
   g.clearRect(sx, 0, SLIT_W, c.height);

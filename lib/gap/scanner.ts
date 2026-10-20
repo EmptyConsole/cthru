@@ -1,5 +1,14 @@
-import { computeEdgeProfile, detectGap, gapQuality, trackGap, type EdgeProfile } from "./edges";
+import {
+  computeEdgeProfile,
+  detectGap,
+  gapQuality,
+  pairMotion,
+  trackGap,
+  type EdgeProfile,
+  type MotionEvidence,
+} from "./edges";
 import { Accumulator } from "./mosaic";
+import { MotionEstimator, type MotionResult } from "./motion";
 import { registerStrip } from "./registration";
 import type { Gap, GrayFrame, Phase, RGBAImage, ScannerStatus } from "./types";
 
@@ -13,6 +22,8 @@ export interface ScannerOptions {
   autoLockFrames?: number;
   /** Initial recording threshold, see `GapScanner.threshold`. */
   threshold?: number;
+  /** See `GapScanner.requireParallax`. Defaults to true. */
+  requireParallax?: boolean;
 }
 
 /** Returns colour pixels for colour-frame columns [sx0, sx1), full height. */
@@ -34,6 +45,17 @@ const QUALITY_HYSTERESIS = 0.08;
 /** Give up on a tracked gap that stays below the threshold this long, and look for a better one. */
 const GIVE_UP_FRAMES = 90;
 export const DEFAULT_THRESHOLD = 0.5;
+/** Per-frame learning rate of the parallax evidence map (scaled by how much differential motion the frame shows). */
+const MOTION_RATE = 0.2;
+/** Parallax score / confidence a gap needs (for CONFIRM_FRAMES frames) to count as confirmed. */
+const CONFIRM_SCORE = 0.2;
+const CONFIRM_CONF = 0.25;
+const CONFIRM_FRAMES = 3;
+
+const smoothstep = (x: number, lo: number, hi: number) => {
+  const t = Math.min(1, Math.max(0, (x - lo) / (hi - lo)));
+  return t * t * (3 - 2 * t);
+};
 
 /**
  * Builds a wide picture of what is behind a vertical gap.
@@ -64,6 +86,18 @@ export class GapScanner {
   recording = false;
   /** Increments every time recording starts — lets the UI give feedback (e.g. a vibration). */
   recordStarts = 0;
+  /**
+   * Only record once sliding the device has shown that the view through the
+   * gap shifts relative to its edges (parallax). This is what tells a real
+   * opening from a rectangle on the wall that merely looks like one.
+   */
+  requireParallax: boolean;
+  /** The current gap / candidate has shown parallax. */
+  parallaxConfirmed = false;
+  /** Latest motion analysis (for debugging overlays). */
+  lastMotion: MotionResult | null = null;
+  /** Per-column parallax evidence, kept aligned with the occluder as it moves. */
+  readonly motionMap: MotionEvidence;
   gap: Gap | null = null;
   candidate: Gap | null = null;
   lastProfile: EdgeProfile | null = null;
@@ -87,6 +121,12 @@ export class GapScanner {
   private aboveStreak = 0;
   private belowStreak = 0;
   private weakFrames = 0;
+  private readonly motionEst: MotionEstimator;
+  /** How far the occluder moved in the image this frame (px, + = right). */
+  private occluderShift = 0;
+  private parallax = { score: 0, conf: 0 };
+  private confirmStreak = 0;
+  private refuteStreak = 0;
 
   private gray: Accumulator;
   private color: Accumulator;
@@ -114,6 +154,9 @@ export class GapScanner {
     this.colorHeight = Math.round(opts.height * opts.colorScale);
     this.autoLockFrames = opts.autoLockFrames ?? 8;
     this.threshold = opts.threshold ?? DEFAULT_THRESHOLD;
+    this.requireParallax = opts.requireParallax ?? true;
+    this.motionEst = new MotionEstimator(opts.width, opts.height);
+    this.motionMap = { evidence: new Float32Array(opts.width), confidence: new Float32Array(opts.width) };
     this.gray = this.makeGray();
     this.color = this.makeColor();
   }
@@ -152,7 +195,14 @@ export class GapScanner {
     this.candidateStreak = 0;
     this.prevGapMid = null;
     this.lastStrip = null;
+    this.resetParallax();
     if (!this.gray.isEmpty) this.needGlobal = true;
+  }
+
+  private resetParallax() {
+    this.parallaxConfirmed = false;
+    this.confirmStreak = 0;
+    this.refuteStreak = 0;
   }
 
   resetMosaic() {
@@ -177,8 +227,11 @@ export class GapScanner {
     this.lostTrack = false;
     this.belowStreak = 0;
     this.weakFrames = 0;
+    // A hand-picked gap is a new gap; an auto-locked one keeps the parallax it showed as a candidate.
+    if (forced) this.resetParallax();
     // Auto-locking already required the quality to clear the threshold.
-    this.startRecording();
+    if (forced || this.recordingAllowed) this.startRecording();
+    else this.recording = false;
     this.gap = gap;
     this.candidate = null;
     this.candidateStreak = 0;
@@ -194,6 +247,11 @@ export class GapScanner {
     this.belowStreak = 0;
   }
 
+  /** Besides quality: has the gap shown parallax (if that's required)? */
+  private get recordingAllowed() {
+    return !this.requireParallax || this.parallaxConfirmed;
+  }
+
   /** Recording gate with hysteresis, so a borderline gap doesn't flicker on and off. */
   private updateRecording() {
     if (this.forced) {
@@ -203,13 +261,13 @@ export class GapScanner {
     const q = this.quality;
     if (this.recording) {
       this.belowStreak = q < this.threshold - QUALITY_HYSTERESIS ? this.belowStreak + 1 : 0;
-      if (this.belowStreak >= DISARM_FRAMES) {
+      if (this.belowStreak >= DISARM_FRAMES || !this.recordingAllowed) {
         this.recording = false;
         this.aboveStreak = 0;
       }
     } else {
       this.aboveStreak = q >= this.threshold ? this.aboveStreak + 1 : 0;
-      if (this.aboveStreak >= ARM_FRAMES) this.startRecording();
+      if (this.aboveStreak >= ARM_FRAMES && this.recordingAllowed) this.startRecording();
     }
     // A gap that never gets good enough is probably not a real gap: look for another.
     this.weakFrames = !this.recording && q < this.threshold ? this.weakFrames + 1 : 0;
@@ -219,7 +277,76 @@ export class GapScanner {
     }
   }
 
+  /**
+   * Update the per-column parallax evidence. The map is shifted with the
+   * occluder each frame, so evidence stays attached to the same place on the
+   * wall (and so to the same gap) while the device moves.
+   */
+  private updateMotion(frame: GrayFrame) {
+    const m = this.motionEst.update(frame);
+    this.lastMotion = m;
+    const { evidence: E, confidence: C } = this.motionMap;
+    const w = this.width;
+    if (!m || m.reliability < 0.3) {
+      // We don't know how things moved: keep the map but trust it less.
+      this.occluderShift = 0;
+      if (m) for (let x = 0; x < w; x++) C[x] *= 0.5;
+      return;
+    }
+    // Current column x shows what was at previous column x + dx.
+    this.occluderShift = -m.dx;
+    if (m.dx !== 0) {
+      const e2 = new Float32Array(w);
+      const c2 = new Float32Array(w);
+      for (let x = 0; x < w; x++) {
+        const xp = x + m.dx;
+        const i = Math.floor(xp);
+        const f = xp - i;
+        if (i >= 0 && i + 1 < w) {
+          e2[x] = E[i] * (1 - f) + E[i + 1] * f;
+          c2[x] = C[i] * (1 - f) + C[i + 1] * f;
+        }
+      }
+      E.set(e2);
+      C.set(c2);
+    }
+    for (let x = 0; x < w; x++) C[x] *= 0.997;
+
+    // Learn only from frames that actually show differential motion somewhere
+    // (sliding, not standing still or just turning), relative to the strongest.
+    // Seeing parallax counts quickly. *Not* seeing it counts slowly and only
+    // when something else in the frame clearly moves differently — otherwise
+    // merely pausing at the end of a sweep would erase a real gap's evidence.
+    const kUp = MOTION_RATE * smoothstep(m.activity, 0.12, 0.35);
+    const kDown = 0.3 * MOTION_RATE * smoothstep(m.activity, 0.3, 0.6);
+    if (kUp <= 0) return;
+    const norm = Math.max(m.activity, 0.25);
+    for (let x = 0; x < w; x++) {
+      const obs = m.observed[x];
+      if (obs <= 0) continue;
+      const n = Math.min(1, m.change[x] / norm);
+      const k = (n > E[x] ? kUp : kDown) * obs;
+      E[x] += k * (n - E[x]);
+      C[x] += kUp * obs * (1 - C[x]);
+    }
+  }
+
+  /** Track whether the gap at columns `cols` has shown parallax. */
+  private updateParallax(cols: [number, number]) {
+    const pm = pairMotion(this.motionMap, cols[0], cols[1]);
+    this.parallax = pm;
+    if (!this.parallaxConfirmed) {
+      this.confirmStreak = pm.conf >= CONFIRM_CONF && pm.score >= CONFIRM_SCORE ? this.confirmStreak + 1 : 0;
+      if (this.confirmStreak >= CONFIRM_FRAMES) this.parallaxConfirmed = true;
+    } else {
+      // Strong evidence that it doesn't move differently after all.
+      this.refuteStreak = pm.conf >= 0.5 && pm.score < 0.05 ? this.refuteStreak + 1 : 0;
+      if (this.refuteStreak > 30) this.resetParallax();
+    }
+  }
+
   processFrame(frame: GrayFrame, getColorStrip: ColorStripProvider): void {
+    this.updateMotion(frame);
     const profile = computeEdgeProfile(frame);
     this.lastProfile = profile;
 
@@ -229,7 +356,7 @@ export class GapScanner {
     }
 
     const prev = this.gap!;
-    const tr = trackGap(profile, prev);
+    const tr = trackGap(profile, prev, this.motionMap, this.occluderShift);
     if (!tr || tr.confidence < MIN_TRACK_CONFIDENCE || tr.gap.right - tr.gap.left < 3) {
       this.confidence = tr?.confidence ?? 0;
       this.quality *= 0.85;
@@ -239,7 +366,8 @@ export class GapScanner {
     }
     this.lostFrames = 0;
     this.confidence = tr.confidence;
-    this.quality += 0.25 * (gapQuality(profile, tr.cols[0], tr.cols[1]) - this.quality);
+    this.quality += 0.25 * (gapQuality(profile, tr.cols[0], tr.cols[1], this.motionMap) - this.quality);
+    this.updateParallax(tr.cols);
     this.updateRecording();
     if (this.phase !== "tracking") return;
     // Smooth small jitter, but follow real jumps immediately.
@@ -267,7 +395,7 @@ export class GapScanner {
   }
 
   private search(profile: EdgeProfile) {
-    const det = detectGap(profile);
+    const det = detectGap(profile, {}, this.motionMap);
     if (!det || det.confidence < 0.2) {
       this.candidate = null;
       this.candidateStreak = 0;
@@ -277,7 +405,10 @@ export class GapScanner {
     }
     const raw = det.quality;
     const tol = Math.max(3, this.width * 0.03);
-    const c = this.candidate;
+    // The candidate moves with the occluder.
+    const sh = this.occluderShift;
+    const c = this.candidate ? { left: this.candidate.left + sh, right: this.candidate.right + sh } : null;
+    if (c) this.candidate = c;
     if (c && Math.abs(c.left - det.gap.left) < tol && Math.abs(c.right - det.gap.right) < tol) {
       // Follow the gap closely: it moves while the user aims the device.
       this.candidate = {
@@ -295,7 +426,9 @@ export class GapScanner {
       this.candidateStreak = 0;
       this.candidate = det.gap;
       this.quality = raw;
+      this.resetParallax();
     }
+    this.updateParallax(det.cols);
     this.confidence = det.confidence;
     // Only a candidate that is stable *and* good enough counts towards locking.
     this.candidateStreak = this.quality >= this.threshold ? this.candidateStreak + 1 : 0;
@@ -399,16 +532,22 @@ export class GapScanner {
 
     const pct = (v: number) => `${Math.round(v * 100)}%`;
     const belowThreshold = this.quality < this.threshold;
+    const awaitingParallax = !this.forced && this.requireParallax && !this.parallaxConfirmed;
     let hint: string;
     if (this.phase === "searching") {
       if (this.candidate && belowThreshold) {
         hint = `Gap found, but its quality (${pct(this.quality)}) is below the ${pct(this.threshold)} needed to record. Get closer, add light, hold it upright, or lower the threshold. Dragging across the gap also starts recording.`;
+      } else if (this.candidate && awaitingParallax) {
+        hint = "Found a likely gap. Slide the device sideways a little to confirm it's a real opening.";
       } else if (this.candidate) hint = "Found a good gap. Hold steady and recording will start.";
       else if (this.rejected) hint = "That gap never got clear enough to record. Looking for a better one…";
       else if (this.lostTrack) hint = "Lost the gap. Point back at it to continue the scan.";
       else hint = "Point the camera at a vertical gap and hold the device upright. You can also drag across the gap to pick it.";
     } else if (!this.scanning) {
       hint = "Paused. The gap is still tracked. Press Resume to keep building the image.";
+    } else if (!this.recording && awaitingParallax) {
+      hint =
+        "Gap found. Now slide the device sideways a little. Recording starts once the view through the gap shifts against its edges, which shows it's a real opening and not just something on the wall.";
     } else if (!this.recording) {
       hint = `Not recording: the gap's quality (${pct(this.quality)}) dropped below ${pct(this.threshold)}. Hold steady and keep it in view, and recording resumes when it's clearer.`;
     } else if (this.lostFrames > 0) {
@@ -444,6 +583,11 @@ export class GapScanner {
       framesUsed: this.framesUsed,
       revealRate: this.revealRate,
       rotating,
+      requireParallax: this.requireParallax,
+      parallax: this.parallax.score,
+      parallaxConf: this.parallax.conf,
+      parallaxConfirmed: this.parallaxConfirmed,
+      awaitingParallax: this.phase === "tracking" ? awaitingParallax : this.requireParallax && !this.parallaxConfirmed,
       hint,
     };
   }

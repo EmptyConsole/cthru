@@ -14,6 +14,7 @@ const MAX_COLOR_SCALE = 3;
 /** If processing a frame takes longer than this (ms, smoothed), skip every other frame. */
 const FRAME_BUDGET_MS = 28;
 const THRESHOLD_KEY = "seethroughgap.threshold";
+const PARALLAX_KEY = "seethroughgap.requireParallax";
 
 type TorchState = { available: boolean; on: boolean };
 type CameraOption = { id: string; label: string };
@@ -31,6 +32,22 @@ function loadThreshold(): number {
 function saveThreshold(v: number) {
   try {
     localStorage.setItem(THRESHOLD_KEY, String(v));
+  } catch {
+    // Not critical.
+  }
+}
+
+function loadRequireParallax(): boolean {
+  try {
+    return localStorage.getItem(PARALLAX_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+function saveRequireParallax(v: boolean) {
+  try {
+    localStorage.setItem(PARALLAX_KEY, String(v));
   } catch {
     // Not critical.
   }
@@ -54,6 +71,7 @@ export default function GapScannerApp() {
   const debugRef = useRef(false);
   const mirrorRef = useRef(false);
   const thresholdRef = useRef(DEFAULT_THRESHOLD);
+  const requireParallaxRef = useRef(true);
   const hasMosaicRef = useRef(false);
   const userScrolledAt = useRef(0);
 
@@ -66,6 +84,7 @@ export default function GapScannerApp() {
   const [mirror, setMirror] = useState(false);
   const [debug, setDebug] = useState(false);
   const [threshold, setThreshold] = useState(DEFAULT_THRESHOLD);
+  const [requireParallax, setRequireParallax] = useState(true);
   const [torch, setTorch] = useState<TorchState>({ available: false, on: false });
   const [cameras, setCameras] = useState<CameraOption[]>([]);
   const [cameraId, setCameraId] = useState<string>("");
@@ -78,7 +97,12 @@ export default function GapScannerApp() {
     // Read the saved threshold after mount so server and client render the same HTML.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setThreshold(loadThreshold());
+    setRequireParallax(loadRequireParallax());
   }, []);
+  useEffect(() => {
+    requireParallaxRef.current = requireParallax;
+    if (scannerRef.current) scannerRef.current.requireParallax = requireParallax;
+  }, [requireParallax]);
   useEffect(() => {
     thresholdRef.current = threshold;
     if (scannerRef.current) scannerRef.current.threshold = threshold;
@@ -251,7 +275,8 @@ export default function GapScannerApp() {
       const L = X(scanner.gap.left);
       const R = X(scanner.gap.right);
       const live = scanner.scanning && scanner.recording;
-      const color = !scanner.scanning ? "#94a3b8" : live ? "#34d399" : "#fbbf24";
+      const awaiting = scanner.requireParallax && !scanner.parallaxConfirmed && !live;
+      const color = !scanner.scanning ? "#94a3b8" : live ? "#34d399" : awaiting ? "#38bdf8" : "#fbbf24";
       g.fillStyle = "rgba(0,0,0,0.45)";
       g.fillRect(0, 0, L, ch);
       g.fillRect(R, 0, cw - R, ch);
@@ -302,20 +327,24 @@ export default function GapScannerApp() {
     }
 
     if (debugRef.current && scanner.lastProfile) {
-      const c = scanner.lastProfile.coherence;
       const h = ch * 0.25;
       g.fillStyle = "rgba(0,0,0,0.5)";
       g.fillRect(0, ch - h, cw, h);
-      g.strokeStyle = "#f472b6";
-      g.lineWidth = 1.5 * dpr;
-      g.beginPath();
-      for (let x = 0; x < c.length; x++) {
-        const px = X(x);
-        const py = ch - c[x] * h;
-        if (x === 0) g.moveTo(px, py);
-        else g.lineTo(px, py);
-      }
-      g.stroke();
+      const plot = (arr: Float32Array, color: string) => {
+        g.strokeStyle = color;
+        g.lineWidth = 1.5 * dpr;
+        g.beginPath();
+        for (let x = 0; x < arr.length; x++) {
+          const px = X(x);
+          const py = ch - Math.min(1, arr[x]) * h;
+          if (x === 0) g.moveTo(px, py);
+          else g.lineTo(px, py);
+        }
+        g.stroke();
+      };
+      // Pink: edge strength. Cyan: parallax evidence (moves differently from the occluder).
+      plot(scanner.lastProfile.coherence, "#f472b6");
+      plot(scanner.motionMap.evidence, "#22d3ee");
     }
   }, []);
 
@@ -444,7 +473,13 @@ export default function GapScannerApp() {
         const S = Math.min(MAX_COLOR_SCALE, Math.max(1, Math.max(sw, sh) / ANALYSIS_MAX));
         analysis.width = wa;
         analysis.height = ha;
-        const scanner = new GapScanner({ width: wa, height: ha, colorScale: S, threshold: thresholdRef.current });
+        const scanner = new GapScanner({
+          width: wa,
+          height: ha,
+          colorScale: S,
+          threshold: thresholdRef.current,
+          requireParallax: requireParallaxRef.current,
+        });
         scannerRef.current = scanner;
         // Handy for inspecting the pipeline from the browser console during development.
         if (process.env.NODE_ENV === "development") (window as unknown as { gapScanner: GapScanner }).gapScanner = scanner;
@@ -552,6 +587,13 @@ export default function GapScannerApp() {
     }, "image/png");
   }, []);
 
+  const changeRequireParallax = (v: boolean) => {
+    requireParallaxRef.current = v;
+    if (scannerRef.current) scannerRef.current.requireParallax = v;
+    setRequireParallax(v);
+    saveRequireParallax(v);
+  };
+
   const changeThreshold = (v: number) => {
     // Update the ref right away so rapid key repeats build on each other.
     thresholdRef.current = v;
@@ -572,6 +614,7 @@ export default function GapScannerApp() {
       } else if (k === "r" || k === "l") toggleLock();
       else if (k === "c") resetImage();
       else if (k === "m") setMirror((m) => !m);
+      else if (k === "p") changeRequireParallax(!requireParallaxRef.current);
       else if (k === "s") download();
       else if (k === "[" || k === "]") {
         const next = Math.round((thresholdRef.current + (k === "]" ? 0.05 : -0.05)) * 100) / 100;
@@ -628,7 +671,9 @@ export default function GapScannerApp() {
         ? { label: "Paused", cls: "bg-slate-300/90 text-slate-900" }
         : status.recording
           ? { label: status.forced ? "REC · picked by hand" : "REC", cls: "bg-red-500/90 text-white", rec: true }
-          : { label: "Waiting for a clearer gap", cls: "bg-amber-400/90 text-amber-950" };
+          : status.awaitingParallax
+            ? { label: "Slide sideways to confirm", cls: "bg-sky-400/90 text-sky-950" }
+            : { label: "Waiting for a clearer gap", cls: "bg-amber-400/90 text-amber-950" };
 
   const controls = (
     <>
@@ -780,10 +825,45 @@ export default function GapScannerApp() {
                 <span>Strict</span>
               </span>
             </label>
+            <label className="flex items-start gap-2 text-sm text-neutral-300">
+              <input
+                type="checkbox"
+                className="mt-1"
+                checked={requireParallax}
+                onChange={(e) => changeRequireParallax(e.target.checked)}
+              />
+              <span>
+                Wait for parallax
+                <span className="block text-xs text-neutral-500">
+                  Only record once sliding shows the view through the gap shifting against its edges. This rejects
+                  things on the wall that just look like gaps.
+                </span>
+              </span>
+            </label>
+            {status && (status.phase === "tracking" || status.candidate) && (
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-neutral-400">Parallax</span>
+                <span
+                  className={
+                    status.parallaxConfirmed
+                      ? "font-semibold text-emerald-300"
+                      : status.parallaxConf > 0.3 && status.parallax < 0.1
+                        ? "font-semibold text-rose-300"
+                        : "text-sky-300"
+                  }
+                >
+                  {status.parallaxConfirmed
+                    ? "confirmed: real opening"
+                    : status.parallaxConf > 0.3 && status.parallax < 0.1
+                      ? "none: probably not a gap"
+                      : "not seen yet: slide sideways"}
+                </span>
+              </div>
+            )}
             <p className="text-xs leading-relaxed text-neutral-500">
-              Quality combines how sharp and straight both edges are, whether something different shows through, and
-              how steady it is. Nothing is recorded until a gap clears this bar, and recording pauses if it drops well
-              below. Dragging across a gap records it regardless.
+              Quality combines straight, full-height edges, how different the view inside looks and how much detail it
+              has, and (once you slide) whether it moves differently from its surroundings. Nothing is recorded until a
+              gap clears this bar. Dragging across a gap records it regardless.
             </p>
           </section>
 
@@ -796,7 +876,7 @@ export default function GapScannerApp() {
               </label>
               <p className="text-xs text-neutral-500">
                 Keys: <Kbd>Space</Kbd> pause · <Kbd>R</Kbd> re-detect / record · <Kbd>C</Kbd> clear · <Kbd>[</Kbd>
-                <Kbd>]</Kbd> threshold · <Kbd>M</Kbd> mirror · <Kbd>S</Kbd> save
+                <Kbd>]</Kbd> threshold · <Kbd>P</Kbd> parallax · <Kbd>M</Kbd> mirror · <Kbd>S</Kbd> save
               </p>
             </section>
           )}
@@ -996,9 +1076,16 @@ function HowItWorks() {
             result keeps the scene&apos;s real left-right orientation, whichever way you move.
           </p>
           <p>
-            Recording only starts once the detected gap&apos;s quality clears the threshold you set, so random edges in
-            the room don&apos;t get stitched in. Raise it if it records things that aren&apos;t gaps; lower it for faint,
-            dark or low-contrast gaps.
+            To find the gap it combines four cues: two straight edges running the full height of the view; a view
+            inside that looks different, with a different amount of detail; and, most tellingly, <strong>motion</strong>.
+            As you slide, the occluder moves as one piece while the view through a real gap shifts at a different speed
+            and keeps revealing new content. A picture frame or book on the wall can look like a gap in a still image,
+            but it moves with the wall, so it&apos;s rejected.
+          </p>
+          <p>
+            Recording only starts once the gap&apos;s quality clears your threshold and (with &quot;Wait for
+            parallax&quot;) sliding has confirmed it&apos;s a real opening. Raise the threshold if it records things that
+            aren&apos;t gaps; lower it for faint, dark or low-contrast gaps.
           </p>
           <ul className="list-disc space-y-1 pl-5">
             <li>Hold the device upright so the gap runs straight up the screen.</li>

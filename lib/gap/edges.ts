@@ -1,12 +1,11 @@
 import type { Gap, GrayFrame } from "./types";
 
 /**
- * Per-column summary of how strongly each column holds a long, straight,
- * vertical edge. The opening of a vertical gap is bounded by two such edges.
+ * Per-column summary of a frame used to find the two sides of a vertical gap.
  *
- * The measure is deliberately sign-agnostic: what shows through a gap changes
- * from row to row (sky, then a dark wall, then a bright sign…), so the same
- * boundary can be bright→dark in one row and dark→bright in the next.
+ * The edge measure is deliberately sign-agnostic: what shows through a gap
+ * changes from row to row (sky, then a dark wall, then a bright sign…), so the
+ * same boundary can be bright→dark in one row and dark→bright in the next.
  */
 export interface EdgeProfile {
   width: number;
@@ -17,6 +16,12 @@ export interface EdgeProfile {
    * scattered texture scores low. Index x is the boundary between pixel x and x+1.
    */
   coherence: Float32Array;
+  /**
+   * 0..1: share of the frame's height (in EXTENT_BANDS row bands) in which
+   * column x holds an edge. A gap's sides usually run the full height of the
+   * view; most rectangular objects (books, frames, screens) don't.
+   */
+  extent: Float32Array;
   /** Mean |I(x+1) - I(x)| over the analysed rows (for subpixel localisation). */
   meanAbsGrad: Float32Array;
   /** Mean intensity of each column over the analysed rows. */
@@ -31,9 +36,28 @@ export interface EdgeProfile {
    * inside of a gap and its sides vary from top to bottom, cheaply.
    */
   bandPrefix: Float32Array;
+  /**
+   * Running sum over columns of mean |I(x, y+1) - I(x, y)|: the amount of
+   * horizontal structure ("detail") in each column. The view through a gap
+   * usually has a different amount of detail from the occluder around it.
+   */
+  detailPrefix: Float32Array;
+}
+
+/**
+ * Accumulated evidence of parallax per column (see `MotionEstimator`):
+ * `evidence` 0..1 is how strongly a column moves differently from the
+ * occluder; `confidence` 0..1 is how much we have actually observed it.
+ */
+export interface MotionEvidence {
+  evidence: Float32Array;
+  confidence: Float32Array;
 }
 
 const BANDS = 12;
+const EXTENT_BANDS = 6;
+/** A row band counts as "has an edge here" above this band-level coherence. */
+const EXTENT_MIN = 0.35;
 
 /** Contrast (after normalisation, in 0..255 levels) that counts as a fully strong edge. */
 const EDGE_FULL = 40;
@@ -72,18 +96,23 @@ export function computeEdgeProfile(frame: GrayFrame, rowStartFrac = 0.08, rowEnd
   const gain = contrastGain(frame);
 
   const strength = new Float32Array(w);
+  const bandStrength = new Float32Array(EXTENT_BANDS * w);
   const meanAbsGrad = new Float32Array(w);
   const colMean = new Float32Array(w);
+  const detail = new Float32Array(w);
   const a = new Float32Array(w);
   const lm = new Float32Array(w);
 
   for (let y = y0; y < y1; y++) {
     const r = y * w;
+    const eb = Math.min(EXTENT_BANDS - 1, Math.floor(((y - y0) * EXTENT_BANDS) / rows)) * w;
     for (let x = 0; x < w - 1; x++) a[x] = Math.abs(data[r + x + 1] - data[r + x]) * gain;
     a[w - 1] = 0;
+    const below = y + 1 < h ? r + w : r;
     for (let x = 0; x < w; x++) {
       colMean[x] += data[r + x];
       meanAbsGrad[x] += a[x];
+      detail[x] += Math.abs(data[below + x] - data[r + x]) * gain;
       lm[x] = 0;
     }
     // Keep only this row's real edges: local maxima over ±2 columns.
@@ -94,15 +123,32 @@ export function computeEdgeProfile(frame: GrayFrame, rowStartFrac = 0.08, rowEnd
       }
     }
     // Allow one column of slack so slightly tilted or wobbly edges still add up.
-    for (let x = 1; x < w - 1; x++) strength[x] += Math.max(lm[x - 1], lm[x], lm[x + 1]);
+    for (let x = 1; x < w - 1; x++) {
+      const v = Math.max(lm[x - 1], lm[x], lm[x + 1]);
+      strength[x] += v;
+      bandStrength[eb + x] += v;
+    }
   }
 
   const coherence = new Float32Array(w);
+  const detailPrefix = new Float32Array(w + 1);
   for (let x = 0; x < w; x++) {
     coherence[x] = strength[x] / (rows * EDGE_FULL);
     colMean[x] /= rows;
     meanAbsGrad[x] /= rows;
+    detailPrefix[x + 1] = detailPrefix[x] + detail[x] / rows;
   }
+
+  const bandRows = rows / EXTENT_BANDS;
+  const rawExtent = new Float32Array(w);
+  for (let x = 0; x < w; x++) {
+    let n = 0;
+    for (let k = 0; k < EXTENT_BANDS; k++) if (bandStrength[k * w + x] / (bandRows * EDGE_FULL) >= EXTENT_MIN) n++;
+    rawExtent[x] = n / EXTENT_BANDS;
+  }
+  const extent = new Float32Array(w);
+  for (let x = 0; x < w; x++) extent[x] = Math.max(rawExtent[Math.max(0, x - 1)], rawExtent[x], rawExtent[Math.min(w - 1, x + 1)]);
+
   const bandPrefix = new Float32Array(BANDS * (w + 1));
   for (let k = 0; k < BANDS; k++) {
     const by0 = y0 + Math.floor((rows * k) / BANDS);
@@ -116,7 +162,17 @@ export function computeEdgeProfile(frame: GrayFrame, rowStartFrac = 0.08, rowEnd
   }
 
   const sorted = Float32Array.from(coherence).sort();
-  return { width: w, coherence, meanAbsGrad, colMean, baseline: sorted[sorted.length >> 1], bands: BANDS, bandPrefix };
+  return {
+    width: w,
+    coherence,
+    extent,
+    meanAbsGrad,
+    colMean,
+    baseline: sorted[sorted.length >> 1],
+    bands: BANDS,
+    bandPrefix,
+    detailPrefix,
+  };
 }
 
 /** Subpixel boundary position near column `x`, from the mean gradient-magnitude profile. */
@@ -156,12 +212,51 @@ export interface PairMetrics {
   right: number;
   /** How different the inside looks from the less different of the two sides, 0..1. */
   contrast: number;
+  /** How different the amount of detail inside is from the less different side, 0..1. */
+  detail: number;
+  /** The inside has more detail than both sides. */
+  moreDetail: boolean;
+  /** Share of the frame's height both sides run along, 0..1. */
+  extent: number;
   /** How much stronger the strongest edge inside the pair is than allowed (0 = clean). */
   innerExcess: number;
+  /** Parallax score: inside moves differently from the sides (-1..1, 0 if unobserved). */
+  motion: number;
+  /** How much of that parallax has actually been observed, 0..1. */
+  motionConf: number;
+}
+
+const mean = (arr: Float32Array, x0: number, x1: number) => {
+  let s = 0;
+  let n = 0;
+  for (let x = Math.max(0, x0); x < Math.min(arr.length, x1); x++, n++) s += arr[x];
+  return n ? s / n : 0;
+};
+
+/**
+ * Parallax evidence for the gap between columns a < b: how much more the inside
+ * moves differently from the occluder than the sides do. A real gap scores
+ * clearly positive once the device has slid a little; a rectangle stuck on
+ * the wall scores about zero.
+ */
+export function pairMotion(motion: MotionEvidence | undefined, a: number, b: number): { score: number; conf: number } {
+  if (!motion) return { score: 0, conf: 0 };
+  const w = motion.evidence.length;
+  const width = b - a;
+  // Stay clear of the edges themselves: they blur in and out of both regions.
+  const m = Math.max(1, Math.round(width * 0.15));
+  const fw = Math.round(clamp(width, 4, w * 0.1));
+  const inside = mean(motion.evidence, a + 1 + m, b + 1 - m);
+  const left = mean(motion.evidence, a - fw - 1, a - 1);
+  const right = mean(motion.evidence, b + 3, b + 3 + fw);
+  // Only the inside has to have been observed: a featureless wall beside a gap
+  // can't show motion either way, and simply counts as moving with the occluder.
+  const conf = mean(motion.confidence, a + 1 + m, b + 1 - m);
+  return { score: inside - Math.max(left, right), conf };
 }
 
 /** Measurements describing how much columns a < b look like the two sides of one gap. */
-export function pairMetrics(p: EdgeProfile, a: number, b: number): PairMetrics {
+export function pairMetrics(p: EdgeProfile, a: number, b: number, motion?: MotionEvidence): PairMetrics {
   const w = p.width;
   const c = p.coherence;
   const width = b - a;
@@ -172,10 +267,10 @@ export function pairMetrics(p: EdgeProfile, a: number, b: number): PairMetrics {
   const fw = Math.round(clamp(width, 3, w * 0.1));
   const lx0 = Math.max(0, a - fw);
   const rx1 = Math.min(w, b + 2 + fw);
+  const P = p.bandPrefix;
   let dl = 0;
   let dr = 0;
   for (let k = 0; k < p.bands; k++) {
-    const P = p.bandPrefix;
     const o = k * (w + 1);
     const inner = (P[o + b + 1] - P[o + a + 1]) / width;
     const left = (P[o + a + 1] - P[o + lx0]) / Math.max(1, a + 1 - lx0);
@@ -186,41 +281,73 @@ export function pairMetrics(p: EdgeProfile, a: number, b: number): PairMetrics {
   // Use the side that differs least: both sides should differ from the inside.
   const diff = Math.min(dl, dr) / p.bands;
 
+  // Detail: compare the amount of horizontal structure inside vs each side
+  // (skipping the edge columns, whose own blur would count as detail).
+  const D = p.detailPrefix;
+  const ia = Math.min(a + 2, b);
+  const ib = Math.max(b, ia + 1);
+  const dIn = (D[ib] - D[ia]) / Math.max(1, ib - ia);
+  const dL = (D[Math.max(lx0, a - 1)] - D[lx0]) / Math.max(1, a - 1 - lx0);
+  const dR = (D[rx1] - D[Math.min(rx1, b + 3)]) / Math.max(1, rx1 - b - 3);
+  const ratio = (x: number, y: number) => Math.abs(Math.log((x + 3) / (y + 3)));
+  const detail = Math.min(1, Math.min(ratio(dIn, dL), ratio(dIn, dR)) / Math.log(2.5));
+
   let innerMax = 0;
   for (let x = a + 3; x <= b - 3; x++) innerMax = Math.max(innerMax, c[x]);
   const weaker = Math.min(c[a], c[b]);
+  const pm = pairMotion(motion, a, b);
   return {
     left: c[a],
     right: c[b],
     contrast: Math.min(1, diff / 25),
+    detail,
+    moreDetail: dIn > Math.max(dL, dR),
+    extent: Math.min(p.extent[a], p.extent[b]),
     innerExcess: Math.max(0, innerMax - 0.6 * weaker),
+    motion: pm.score,
+    motionConf: pm.conf,
   };
 }
 
 /**
- * Ranking score for candidate pairs: two strong edges of similar strength, an
- * inside that looks different from the occluder on either side, and no
- * stronger edges inside (which would mean a and b are really the outer edges
- * of something else).
+ * Ranking score for candidate pairs: two strong, full-height edges of similar
+ * strength, an inside that looks different from the occluder on either side,
+ * no stronger edges inside (which would mean a and b are really the outer
+ * edges of something else), and — once observed — an inside that moves
+ * differently from the sides.
  */
-export function pairScore(p: EdgeProfile, a: number, b: number): number {
-  return scoreFromMetrics(pairMetrics(p, a, b));
+export function pairScore(p: EdgeProfile, a: number, b: number, motion?: MotionEvidence): number {
+  return scoreFromMetrics(pairMetrics(p, a, b, motion));
 }
 
 function scoreFromMetrics(m: PairMetrics): number {
-  return m.left + m.right - 0.3 * Math.abs(m.left - m.right) + 0.4 * m.contrast - 0.5 * m.innerExcess;
+  return (
+    m.left +
+    m.right -
+    0.3 * Math.abs(m.left - m.right) +
+    0.4 * m.contrast +
+    0.2 * m.detail +
+    0.3 * m.extent -
+    0.5 * m.innerExcess +
+    1.2 * m.motionConf * m.motion
+  );
 }
 
 /** Edge strength that counts as a fully convincing boundary. */
 const QUALITY_EDGE_FULL = 0.7;
 
 /**
- * How convincingly columns a < b bound a real see-through gap, 0..1, for a
- * single frame. Weak or lopsided edges, an inside that looks like the
- * occluder, or strong edges inside all pull it down.
+ * How convincingly columns a < b bound a real see-through gap, 0..1.
+ *
+ * Multiplies together: edge strength (relative to the frame's typical
+ * column), how different the inside looks and how much detail it has compared
+ * with the sides, edge balance, a clean inside, and full-height edges. Once
+ * the device has moved enough to observe parallax, that evidence takes over
+ * from appearance: a real gap's inside slides relative to its edges; a
+ * rectangle on the wall doesn't.
  */
-export function gapQuality(p: EdgeProfile, a: number, b: number): number {
-  return qualityFromMetrics(p, pairMetrics(p, a, b));
+export function gapQuality(p: EdgeProfile, a: number, b: number, motion?: MotionEvidence): number {
+  return qualityFromMetrics(p, pairMetrics(p, a, b, motion));
 }
 
 function qualityFromMetrics(p: EdgeProfile, m: PairMetrics): number {
@@ -232,12 +359,20 @@ function qualityFromMetrics(p: EdgeProfile, m: PairMetrics): number {
   const edge = clamp((weaker - base) / Math.max(0.2, QUALITY_EDGE_FULL - base), 0, 1);
   const balance = weaker / stronger;
   const clean = 1 - Math.min(1, m.innerExcess / Math.max(0.1, weaker));
-  // Seeing *something different* through the opening is the strongest cue.
-  return clamp(edge * (0.2 + 0.8 * m.contrast) * (0.75 + 0.25 * balance) * (0.7 + 0.3 * clean), 0, 1);
+
+  // Seeing *something different* through the opening is the strongest still-image cue.
+  const appearance = clamp(0.65 * m.contrast + 0.35 * m.detail + (m.moreDetail ? 0.1 : 0), 0, 1);
+  let evidence = 0.2 + 0.8 * appearance;
+  if (m.motionConf > 0) {
+    // Parallax beats appearance once we've seen it (or seen its absence).
+    const parallax = clamp(0.25 + 1.5 * m.motion, 0, 1);
+    evidence += clamp(m.motionConf * 1.5, 0, 1) * (parallax - evidence);
+  }
+  return clamp(edge * evidence * (0.75 + 0.25 * balance) * (0.7 + 0.3 * clean) * (0.55 + 0.45 * m.extent), 0, 1);
 }
 
 /** Find the most plausible vertical gap in a single frame. */
-export function detectGap(p: EdgeProfile, opts: DetectOptions = {}): GapDetection | null {
+export function detectGap(p: EdgeProfile, opts: DetectOptions = {}, motion?: MotionEvidence): GapDetection | null {
   const w = p.width;
   const c = p.coherence;
   const minW = Math.max(4, Math.round(w * (opts.minWidthFrac ?? 0.025)));
@@ -269,7 +404,7 @@ export function detectGap(p: EdgeProfile, opts: DetectOptions = {}): GapDetectio
       const off = ((a + b) / 2 - w / 2) / (w / 2);
       // Rank by both the edge score and the quality used to trigger recording,
       // so detection prefers the pair that recording would accept.
-      const m = pairMetrics(p, a, b);
+      const m = pairMetrics(p, a, b, motion);
       const quality = qualityFromMetrics(p, m);
       const score = scoreFromMetrics(m) + quality - 0.35 * off * off;
       if (!best || score > best.score) {
@@ -290,14 +425,15 @@ export interface TrackResult {
 
 /**
  * Follow a known gap into the next frame. Both edges belong to the same
- * occluder, so they are searched as one rigid shift plus a small width change.
+ * occluder, so they are searched as one rigid shift plus a small width change,
+ * starting from where the occluder's own motion (`shift`, px) says they went.
  */
-export function trackGap(p: EdgeProfile, prev: Gap): TrackResult | null {
+export function trackGap(p: EdgeProfile, prev: Gap, motion?: MotionEvidence, shift = 0): TrackResult | null {
   const w = p.width;
   const c = p.coherence;
   const r = Math.max(4, Math.round(w * 0.06));
-  const a0 = Math.round(prev.left - 0.5);
-  const b0 = Math.round(prev.right - 0.5);
+  const a0 = Math.round(prev.left - 0.5 + shift);
+  const b0 = Math.round(prev.right - 0.5 + shift);
 
   let bestScore = -Infinity;
   let ba = -1;
@@ -309,7 +445,7 @@ export function trackGap(p: EdgeProfile, prev: Gap): TrackResult | null {
       if (a < 2 || b > w - 4 || b - a < 3) continue;
       // Cheap pre-filter before the full pair score.
       if (c[a] + c[b] < 0.3) continue;
-      const s = pairScore(p, a, b) - 0.03 * Math.abs(om) - 0.004 * Math.abs(d);
+      const s = pairScore(p, a, b, motion) - 0.03 * Math.abs(om) - 0.008 * Math.abs(d);
       if (s > bestScore) {
         bestScore = s;
         ba = a;

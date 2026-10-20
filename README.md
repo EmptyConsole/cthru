@@ -32,8 +32,11 @@ page.
    (default 50%, adjustable, remembered on this device). The REC badge shows
    when it is recording. If it picks the wrong thing, drag across the gap in
    the camera view. A gap you pick by hand records whatever its quality.
-3. **Slide** the device sideways, slowly, keeping the same distance. Turning on
-   the spot reveals nothing new; the app warns you if you do that.
+3. **Slide** the device sideways, slowly, keeping the same distance. With
+   **Wait for parallax** on (the default), recording only starts once sliding
+   shows the view through the gap shifting against its edges. That's what proves
+   it's a real opening and not a poster, frame or book on the wall. Turning on the
+   spot reveals nothing new; the app warns you if you do that.
 4. Sweep back and forth to fill in and clean up the picture, then **Download
    PNG**.
 
@@ -45,13 +48,19 @@ buzz when recording starts (where supported), the torch button appears when the
 camera has one, and you can switch cameras (for example to the ultra-wide).
 **On computers** the controls sit beside the camera view, and there are keyboard
 shortcuts: <kbd>Space</kbd> pause, <kbd>R</kbd> re-detect / record,
-<kbd>C</kbd> clear, <kbd>[</kbd> <kbd>]</kbd> threshold, <kbd>M</kbd> mirror,
-<kbd>S</kbd> save.
+<kbd>C</kbd> clear, <kbd>[</kbd> <kbd>]</kbd> threshold, <kbd>P</kbd> wait for
+parallax, <kbd>M</kbd> mirror, <kbd>S</kbd> save.
+
+Tick **Show edge graph** to see what the detector sees: pink is edge strength
+per column, and cyan is parallax evidence (where the image moves differently from
+the occluder). The demo fence has a poster and a sign on it. Both look like gaps
+to the edge detector, but they show no parallax, so they're ignored.
 
 ## How it works
 
 ```
-frame → gray (≤360 px) ─┬─ edge profile → detect / track the gap
+frame → gray (≤360 px) ─┬─ motion vs previous frame → parallax evidence map ─┐
+                        ├─ edge / detail / extent profile ───────────────────┴→ detect / track the gap
                         └─ strip inside the gap → register against the mosaic → accumulate
 frame → colour (≤3×)  ──────────────────────────────────────────────────────────┘
 ```
@@ -62,15 +71,39 @@ scene (parallax), so the scene slides past the opening. Sliding right reveals
 what is further *left*, the reverse of a normal panorama. Turning the device
 moves both layers equally, so it reveals nothing.
 
-**Gap detection** (`lib/gap/edges.ts`). In each row, only the local maxima of
-the horizontal gradient magnitude count as edges. They are capped and averaged
-down each column. A long boundary scores near 1, while texture and faint wood
-grain score low. The measure ignores the edge's sign on purpose: what shows
-through a gap changes from row to row, so one boundary can be bright→dark in one
-row and dark→bright in the next. Pairs of strong columns are then scored on:
-similar edge strengths, an inside that looks different from both sides, no
-stronger edges inside, and a mild preference for the centre of the frame. A
-candidate that stays stable for 8 frames locks.
+**Gap detection** (`lib/gap/edges.ts`, `lib/gap/motion.ts`). Edges alone aren't
+enough: a picture frame, book, door panel or poster on a wall has two strong
+vertical edges with something different between them, just like a gap. So
+detection combines four cues:
+
+1. **Edges.** In each row, only the local maxima of the horizontal gradient
+   magnitude count as edges. They are capped and averaged down each column. A long
+   boundary scores near 1, while texture and faint grain score low. The measure
+   ignores the edge's sign: what shows through a gap changes from row to row.
+2. **Extent.** The share of the frame's height (6 row bands) in which each column
+   holds an edge. A gap's sides usually run the full height; most rectangles
+   don't.
+3. **Appearance and detail.** The inside is compared with each side in 12 bands
+   from top to bottom (brightness), plus the amount of horizontal detail. The view
+   through a gap rarely matches the occluder in both.
+4. **Motion: what changes.** This is the decisive cue. The frame is cut into
+   6 px vertical bands, and each is block-matched against the previous frame. The
+   median shift, with near-equal votes per band, is the occluder's motion, refined
+   to sub-pixel accuracy. A band scores high if it fits that motion badly but some
+   other shift well (it slides at a different speed: parallax), or fits no shift
+   well (new content appearing). These scores feed a per-column **parallax
+   evidence map** that is shifted with the occluder every frame, so evidence stays
+   attached to the same place on the wall. Evidence of parallax is learned
+   quickly. Evidence of *no* parallax is learned slowly, and only while something
+   else in the frame clearly moves differently, so pausing at the end of a sweep
+   doesn't erase a real gap. Columns too featureless to show motion count as
+   unobserved, not as "doesn't move".
+
+Pairs of strong columns are ranked on all of these, plus a mild preference for
+the centre of the frame. Once parallax has been observed, it outweighs
+appearance: a real gap's inside moves differently from its sides, and a rectangle
+on the wall scores about zero. A candidate that stays stable and good enough for
+8 frames locks.
 
 **Recording trigger** (`gapQuality` in `edges.ts`, gate in `scanner.ts`).
 Each frame, the gap gets a 0–100% quality score that multiplies together:
@@ -81,18 +114,25 @@ Each frame, the gap gets a 0–100% quality score that multiplies together:
   side in 12 bands from top to bottom (so it still works when the scene behind
   happens to match the occluder's overall brightness);
 - how balanced the two edges are;
-- whether there are stronger edges inside.
+- whether there are stronger edges inside;
+- whether the edges run the full height;
+- and, once the device has slid, parallax, which then outweighs appearance.
 
 The score is smoothed over frames. Auto-lock needs it at or above the threshold
 for 8 stable frames. While tracking, recording starts after 5 frames above the
 threshold, and pauses after 10 frames more than 8 points below it. This
 hysteresis keeps a borderline gap from flickering. A gap that stays too weak for
-about 3 s is dropped, and the scanner looks for a better one. On synthetic tests,
-real slits score 79–99% and pairs of board seams or texture score 15–25%.
+about 3 s is dropped, and the scanner looks for a better one. With **Wait for
+parallax** on, recording also needs the gap to have shown parallax (score ≥ 0.2
+for 3 frames). In synthetic tests, a full-height textured strip on the wall
+scores 100% quality in a still frame, exactly like a real gap. While sliding, its
+parallax stays at or below 0, against about 0.95 for a real opening, so it's
+never recorded.
 
 **Tracking.** Both edges belong to one occluder, so they are searched as one
-rigid shift plus a small width change, using the same pair score. Edge positions
-are refined to subpixel accuracy.
+rigid shift plus a small width change. The search starts where the occluder's
+measured motion says they went, and uses the same pair score, parallax included.
+Edge positions are refined to subpixel accuracy.
 
 **Registration** (`lib/gap/registration.ts`). The strip inside the gap (inset
 from its edges) is matched by normalised cross-correlation against the
@@ -122,12 +162,13 @@ from wherever the new view fits.
 
 | Path | What |
 | --- | --- |
-| `lib/gap/edges.ts` | Edge profile, gap detection, gap tracking |
+| `lib/gap/edges.ts` | Edge / extent / detail profile, pair scoring and quality, detection, tracking |
+| `lib/gap/motion.ts` | Dominant (occluder) motion and per-column differential motion |
 | `lib/gap/registration.ts` | NCC strip-to-mosaic registration |
 | `lib/gap/mosaic.ts` | Growable weighted accumulator |
 | `lib/gap/scanner.ts` | `GapScanner`: state machine tying it together, user hints |
 | `lib/gap/simulator.ts` | Synthetic fence + scene for the demo |
-| `lib/gap/__tests__/` | End-to-end tests on synthetic frames with known motion |
+| `lib/gap/__tests__/` | End-to-end tests on synthetic frames with known motion, including gap look-alikes |
 | `components/GapScannerApp.tsx` | Camera/video/demo sources, overlay, controls, output |
 
 ## Limitations / next steps
@@ -141,3 +182,9 @@ from wherever the new view fits.
   skipped. Moving it to a Web Worker with `OffscreenCanvas` would help on slower
   phones.
 - Rotating the phone mid-scan changes the frame shape, so the scan restarts.
+- Parallax needs depth behind the gap. If what's behind sits almost flush with
+  the opening, or is dark and featureless, sliding shows little or no parallax.
+  Turn off **Wait for parallax** (or drag across the gap) for those.
+- Other things that move on their own (a person walking past, a screen) also
+  "move differently". They still need two straight, full-height edges to be
+  taken for a gap.

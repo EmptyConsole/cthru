@@ -53,5 +53,15 @@ export interface ScannerStatus {
   revealRate: number;
   /** The user is turning the device instead of sliding it. */
   rotating: boolean;
+  /** Recording waits for parallax confirmation. */
+  requireParallax: boolean;
+  /** Parallax score of the tracked gap / candidate: inside moves differently from the sides (-1..1). */
+  parallax: number;
+  /** How much parallax evidence has been observed for it, 0..1. */
+  parallaxConf: number;
+  /** It has shown parallax: the view through it really shifts against its edges. */
+  parallaxConfirmed: boolean;
+  /** Recording is held back until parallax is confirmed. */
+  awaitingParallax: boolean;
   hint: string;
 }
