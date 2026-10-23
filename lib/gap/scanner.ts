@@ -124,9 +124,13 @@ export class GapScanner {
   private readonly motionEst: MotionEstimator;
   /** How far the occluder moved in the image this frame (px, + = right). */
   private occluderShift = 0;
+  /** Fractional part of the occluder motion not yet applied to the evidence map. */
+  private mapShiftRemainder = 0;
   private parallax = { score: 0, conf: 0 };
   private confirmStreak = 0;
   private refuteStreak = 0;
+  /** Frames in a row that a better, overlapping candidate beat the tracked gap. */
+  private betterStreak = 0;
 
   private gray: Accumulator;
   private color: Accumulator;
@@ -293,18 +297,21 @@ export class GapScanner {
       if (m) for (let x = 0; x < w; x++) C[x] *= 0.5;
       return;
     }
-    // Current column x shows what was at previous column x + dx.
+    // Current column x shows what was at previous column x + dx. Shift the
+    // map by whole pixels and carry the fraction over: interpolating a
+    // fractional shift every frame would gradually blur evidence outwards.
     this.occluderShift = -m.dx;
-    if (m.dx !== 0) {
+    this.mapShiftRemainder += m.dx;
+    const shift = Math.round(this.mapShiftRemainder);
+    this.mapShiftRemainder -= shift;
+    if (shift !== 0) {
       const e2 = new Float32Array(w);
       const c2 = new Float32Array(w);
       for (let x = 0; x < w; x++) {
-        const xp = x + m.dx;
-        const i = Math.floor(xp);
-        const f = xp - i;
-        if (i >= 0 && i + 1 < w) {
-          e2[x] = E[i] * (1 - f) + E[i + 1] * f;
-          c2[x] = C[i] * (1 - f) + C[i + 1] * f;
+        const xp = x + shift;
+        if (xp >= 0 && xp < w) {
+          e2[x] = E[xp];
+          c2[x] = C[xp];
         }
       }
       E.set(e2);
@@ -314,13 +321,19 @@ export class GapScanner {
 
     // Learn only from frames that actually show differential motion somewhere
     // (sliding, not standing still or just turning), relative to the strongest.
-    // Seeing parallax counts quickly. *Not* seeing it counts slowly and only
-    // when something else in the frame clearly moves differently — otherwise
-    // merely pausing at the end of a sweep would erase a real gap's evidence.
-    const kUp = MOTION_RATE * smoothstep(m.activity, 0.12, 0.35);
-    const kDown = 0.3 * MOTION_RATE * smoothstep(m.activity, 0.3, 0.6);
+    // Seeing parallax counts a little faster than not seeing it, and *not*
+    // seeing it only counts while something in the frame clearly moves
+    // differently — so pausing at the end of a sweep doesn't erase a real
+    // gap's evidence, yet one-off blips at a boundary don't ratchet up.
+    // Both directions use the same activity gate: frames with only faint,
+    // scattered change (activity below ~0.25; real gaps show 0.8+ while
+    // sliding) teach nothing, and weak change is never scaled up into strong
+    // evidence by the normalisation.
+    const gate = smoothstep(m.activity, 0.25, 0.5);
+    const kUp = MOTION_RATE * gate;
+    const kDown = 0.5 * MOTION_RATE * gate;
     if (kUp <= 0) return;
-    const norm = Math.max(m.activity, 0.25);
+    const norm = Math.max(m.activity, 0.5);
     for (let x = 0; x < w; x++) {
       const obs = m.observed[x];
       if (obs <= 0) continue;
@@ -345,6 +358,33 @@ export class GapScanner {
     }
   }
 
+  /**
+   * Tracking can lock onto slightly wrong boundaries — the outer edge of a
+   * trim or edge face beside the opening, or a thin slice next to it — before
+   * motion has shown where see-through really starts. Keep checking: if a
+   * clearly better candidate that overlaps or touches the tracked gap keeps
+   * winning, move to it. Candidates elsewhere in the frame are left alone so
+   * a fence with several real gaps doesn't make the scan hop between them.
+   */
+  private considerSwitch(profile: EdgeProfile, tr: { gap: Gap; cols: [number, number] }, rawQuality: number) {
+    if (this.forced) return;
+    const det = detectGap(profile, {}, this.motionMap);
+    const g = tr.gap;
+    const touches = det && det.gap.left < g.right + 3 && det.gap.right > g.left - 3;
+    const different = det && (Math.abs(det.gap.left - g.left) > 2 || Math.abs(det.gap.right - g.right) > 2);
+    if (det && touches && different && det.quality > rawQuality + 0.1) {
+      if (++this.betterStreak >= 5) {
+        this.betterStreak = 0;
+        tr.gap = det.gap;
+        tr.cols = det.cols;
+        this.gap = det.gap;
+        this.quality = det.quality;
+      }
+    } else {
+      this.betterStreak = 0;
+    }
+  }
+
   processFrame(frame: GrayFrame, getColorStrip: ColorStripProvider): void {
     this.updateMotion(frame);
     const profile = computeEdgeProfile(frame);
@@ -366,8 +406,10 @@ export class GapScanner {
     }
     this.lostFrames = 0;
     this.confidence = tr.confidence;
-    this.quality += 0.25 * (gapQuality(profile, tr.cols[0], tr.cols[1], this.motionMap) - this.quality);
+    const rawQuality = gapQuality(profile, tr.cols[0], tr.cols[1], this.motionMap);
+    this.quality += 0.25 * (rawQuality - this.quality);
     this.updateParallax(tr.cols);
+    this.considerSwitch(profile, tr, rawQuality);
     this.updateRecording();
     if (this.phase !== "tracking") return;
     // Smooth small jitter, but follow real jumps immediately.

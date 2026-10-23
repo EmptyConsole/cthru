@@ -111,7 +111,7 @@ export interface WorldOptions {
   /** Real openings, by centre offset from the frame centre (in wall coordinates) and width. */
   slits?: { offset: number; width: number }[];
   /** Gap look-alikes on the wall, optionally not full height (fractions of frame height). */
-  objects?: { offset: number; width: number; top?: number; bottom?: number }[];
+  objects?: { offset: number; width: number; top?: number; bottom?: number; value?: number }[];
   noiseAmp?: number;
   t?: number;
 }
@@ -128,7 +128,10 @@ export function renderWorld(p: Pose, o: WorldOptions): GrayFrame {
       for (const s of o.slits ?? []) if (rel >= s.offset - s.width / 2 && rel < s.offset + s.width / 2) v = scene(x + p.bgShift, y + p.dy);
       for (const ob of o.objects ?? []) {
         const inY = y >= (ob.top ?? 0) * H && y < (ob.bottom ?? 1) * H;
-        if (inY && rel >= ob.offset - ob.width / 2 && rel < ob.offset + ob.width / 2) v = painted(xo, y);
+        if (inY && rel >= ob.offset - ob.width / 2 && rel < ob.offset + ob.width / 2) {
+          // A plain surface (e.g. the lit edge face of a table top) or a textured one (a poster).
+          v = ob.value !== undefined ? ob.value + 6 * noise(xo / 3 + 77, y / 25) : painted(xo, y);
+        }
       }
       data[y * W + x] = Math.max(0, Math.min(255, v + (o.noiseAmp ?? 0) * (hash(x + t * 977, y) - 0.5)));
     }

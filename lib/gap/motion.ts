@@ -11,10 +11,10 @@ import type { GrayFrame } from "./types";
  * but it moves with the wall, so here it shows up as "no change".
  *
  * The frame is cut into narrow vertical bands. Each band is block-matched
- * against the previous frame; the weighted median of the bands' best shifts is
- * the dominant (occluder) motion. A band then scores high if it fits the
- * dominant motion badly but fits some other shift well (it is sliding at a
- * different speed), or if it fits no shift well (new content is appearing).
+ * against the previous frame; the median of the bands' best shifts, refined
+ * to sub-pixel accuracy, is the dominant (occluder) motion. Then every pixel
+ * column is checked against that motion at full resolution: columns that
+ * don't fit it (sliding at a different speed, or showing new content) score high.
  */
 
 export interface MotionResult {
@@ -141,96 +141,94 @@ export class MotionEstimator {
     }
     const reliability = total > 0 ? agree / total : 0;
 
-    // Noise floor: the typical residual of a band at its own best shift.
-    const sortedBest = Array.from(best).filter(Number.isFinite).sort((a, b) => a - b);
-    const noise = Math.max(1, sortedBest[sortedBest.length >> 1] ?? 1);
-
-    // Refine the dominant motion to sub-pixel accuracy from the pooled costs of
-    // the agreeing bands. Integer shifts aren't enough: when the wall moves
-    // 0.7 px, a finely textured poster on it can fit a different whole-pixel
-    // shift than the smoother wall around it, which would look like parallax.
-    const gi = gdx - (px - RX);
-    const gj = gdy - (py - RY);
-    const pooled = (i: number, j: number) => {
-      if (i < 0 || i >= nx || j < 0 || j >= ny) return NaN;
-      let sum = 0;
-      for (let b = 0; b < nb; b++) {
-        if (!weights[b] || Math.abs(bestDx[b] - gdx) > 1 || Math.abs(bestDy[b] - gdy) > 1) continue;
-        sum += weights[b] * table[(b * ny + j) * nx + i];
-      }
-      return sum;
-    };
+    // Refine to sub-pixel accuracy: each band refines its own best shift on
+    // its own cost curve, and the dominant motion is the median of those.
+    // Integer shifts aren't enough (when the wall moves 0.7 px, a finely
+    // textured poster on it can fit a different whole-pixel shift than the
+    // smoother wall). And pooling the bands' costs instead would let a few
+    // highly textured bands inside the gap drag the estimate towards the
+    // scene's motion.
     const parabola = (a: number, c0: number, c: number) => {
       if (!Number.isFinite(a) || !Number.isFinite(c)) return 0;
       const den = a - 2 * c0 + c;
       return den > 0 ? Math.max(-0.5, Math.min(0.5, (0.5 * (a - c)) / den)) : 0;
     };
-    const c00 = pooled(gi, gj);
-    const fdx = gdx + parabola(pooled(gi - 1, gj), c00, pooled(gi + 1, gj));
-    const fdy = gdy + parabola(pooled(gi, gj - 1), c00, pooled(gi, gj + 1));
+    const subDx = new Float32Array(nb);
+    const subDy = new Float32Array(nb);
+    for (let b = 0; b < nb; b++) {
+      const i = bestDx[b] - (px - RX);
+      const j = bestDy[b] - (py - RY);
+      const at = (ii: number, jj: number) =>
+        ii < 0 || ii >= nx || jj < 0 || jj >= ny ? NaN : table[(b * ny + jj) * nx + ii];
+      subDx[b] = bestDx[b] + parabola(at(i - 1, j), at(i, j), at(i + 1, j));
+      subDy[b] = bestDy[b] + parabola(at(i, j - 1), at(i, j), at(i, j + 1));
+    }
+    const fdx = weightedMedian(subDx, weights);
+    const fdy = weightedMedian(subDy, weights);
     const ix = Math.floor(fdx);
     const iy = Math.floor(fdy);
     const tx = fdx - ix;
     const ty = fdy - iy;
 
-    const bandChange = new Float32Array(nb);
-    const bandObserved = new Float32Array(nb);
-    for (let b = 0; b < nb; b++) {
-      if (texture[b] < 1.5) continue;
-      // At the frame's sides content enters and leaves view: that isn't parallax.
-      if (b * BAND_W + Math.min(0, gdx) - RX < 0 || (b + 1) * BAND_W + Math.max(0, gdx) + RX > w) continue;
-      bandObserved[b] = Math.min(1, (texture[b] - 1.5) / 3);
-      // Residual of this band at the exact (sub-pixel) dominant motion.
-      let sad = 0;
+    // Per-column (full resolution) disagreement with the dominant motion: the
+    // residual left after warping the previous frame by the exact occluder
+    // motion, relative to how much that column's texture would produce from a
+    // small misalignment. Anything attached to the occluder (a thin edge face,
+    // a trim, a poster) fits almost perfectly, however close it sits to the
+    // gap; the view through the gap — sliding at a different speed, or
+    // revealing new content — doesn't. Bands were too coarse for this: a 6 px
+    // slice beside a gap would inherit the gap's motion.
+    const resid = new Float32Array(w);
+    const tex = new Float32Array(w);
+    const xlo = Math.max(1, Math.ceil(-ix) + 1, RX);
+    const xhi = Math.min(w - 2, Math.floor(w - 2 - ix), w - RX - 1);
+    for (let x = xlo; x <= xhi; x++) {
+      let r = 0;
+      let t = 0;
       let n = 0;
-      for (let y = y0; y < y1; y += ROW_STEP) {
+      const xp = x + ix;
+      for (let y = y0; y < y1; y += 2) {
         const yp = y + iy;
         if (yp < 0 || yp + 1 >= h) continue;
         const rc = y * w;
         const r0 = yp * w;
         const r1 = r0 + w;
-        for (let x = b * BAND_W; x < (b + 1) * BAND_W; x++) {
-          const xp = x + ix;
-          if (xp < 0 || xp + 1 >= w) continue;
-          const v =
-            (prev[r0 + xp] * (1 - tx) + prev[r0 + xp + 1] * tx) * (1 - ty) +
-            (prev[r1 + xp] * (1 - tx) + prev[r1 + xp + 1] * tx) * ty;
-          sad += Math.abs(cur[rc + x] - v);
-          n++;
-        }
+        const v =
+          (prev[r0 + xp] * (1 - tx) + prev[r0 + xp + 1] * tx) * (1 - ty) +
+          (prev[r1 + xp] * (1 - tx) + prev[r1 + xp + 1] * tx) * ty;
+        r += Math.abs(cur[rc + x] - v);
+        t += 0.5 * (Math.abs(cur[rc + x + 1] - cur[rc + x - 1]) + Math.abs(cur[rc + w + x] - cur[rc - w + x]));
+        n++;
       }
-      const eg = n ? sad / n : table[(b * ny + gj) * nx + gi];
-      const emin = best[b];
-      // Moving at a different speed: fits its own shift much better than the dominant one.
-      const differs = Math.max(0, eg - emin - 0.5 * noise) / (eg + noise);
-      // New content appearing: fits no shift well, relative to how textured it is.
-      const unmatched = Math.min(1, Math.max(0, (emin - 1.5 * noise) / (texture[b] + noise)));
-      bandChange[b] = Math.max(differs, unmatched);
+      resid[x] = n ? r / n : 0;
+      tex[x] = n ? t / n : 0;
     }
-    // Activity: the strongest *region* of differential motion. Gaps are narrow
-    // (a few bands), so this is a smoothed peak rather than a percentile; the
-    // smoothing needs ~2 neighbouring bands to agree, so one noisy band can't fake it.
+    const sortedResid = Array.from(resid.subarray(xlo, xhi + 1)).sort((a, b) => a - b);
+    const noise = Math.max(1, sortedResid[sortedResid.length >> 1] ?? 1);
+
+    const raw = new Float32Array(w);
+    const observed = new Float32Array(w);
+    for (let x = xlo; x <= xhi; x++) {
+      if (tex[x] < 1.5) continue;
+      observed[x] = Math.min(1, (tex[x] - 1.5) / 3);
+      raw[x] = Math.min(1, Math.max(0, (resid[x] - 1.2 * noise) / (0.8 * tex[x] + noise)));
+    }
+    // A light [1 2 1] smoothing against pixel noise keeps ~2 px resolution.
+    const change = new Float32Array(w);
+    for (let x = 1; x < w - 1; x++) change[x] = 0.25 * (raw[x - 1] + 2 * raw[x] + raw[x + 1]);
+
+    // Activity: the strongest *region* of differential motion (a 5-column
+    // average, so one noisy column can't fake it).
     let activity = 0;
-    for (let b = 0; b < nb; b++) {
-      const v = 0.25 * (bandChange[Math.max(0, b - 1)] + 2 * bandChange[b] + bandChange[Math.min(nb - 1, b + 1)]);
+    for (let x = 2; x < w - 2; x++) {
+      const v = (change[x - 2] + change[x - 1] + change[x] + change[x + 1] + change[x + 2]) / 5;
       if (v > activity) activity = v;
     }
-
-    // Spread band values over columns, interpolating between band centres.
-    const change = new Float32Array(w);
-    const observed = new Float32Array(w);
-    if (reliability >= 0.3) {
-      for (let x = 0; x < w; x++) {
-        const t = (x + 0.5) / BAND_W - 0.5;
-        const b0 = Math.max(0, Math.min(nb - 1, Math.floor(t)));
-        const b1 = Math.min(nb - 1, b0 + 1);
-        const f = Math.max(0, Math.min(1, t - b0));
-        change[x] = bandChange[b0] * (1 - f) + bandChange[b1] * f;
-        observed[x] = Math.min(bandObserved[b0], bandObserved[b1]);
-      }
-    } else {
+    if (reliability < 0.3) {
       // We don't even know how the occluder moved (e.g. a sudden jump): no evidence.
       activity = 0;
+      change.fill(0);
+      observed.fill(0);
     }
 
     this.pred = reliability >= 0.3 ? { dx: clampAbs(fdx, 40), dy: clampAbs(fdy, 10) } : { dx: 0, dy: 0 };

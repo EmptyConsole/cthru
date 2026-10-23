@@ -218,6 +218,12 @@ export interface PairMetrics {
   moreDetail: boolean;
   /** Share of the frame's height both sides run along, 0..1. */
   extent: number;
+  /**
+   * 0..1: how alike the surfaces just outside the two edges are. Both sides of
+   * a real gap are the occluder; a thin slice beside a gap has the opening on
+   * one side and the occluder on the other.
+   */
+  sidesMatch: number;
   /** How much stronger the strongest edge inside the pair is than allowed (0 = clean). */
   innerExcess: number;
   /** Parallax score: inside moves differently from the sides (-1..1, 0 if unobserved). */
@@ -234,25 +240,31 @@ const mean = (arr: Float32Array, x0: number, x1: number) => {
 };
 
 /**
- * Parallax evidence for the gap between columns a < b: how much more the inside
- * moves differently from the occluder than the sides do. A real gap scores
- * clearly positive once the device has slid a little; a rectangle stuck on
- * the wall scores about zero.
+ * Parallax evidence for the gap between columns a < b, judged at its
+ * boundaries: the view just inside *each* edge (and in the middle) should move
+ * differently from the occluder, and the surface just outside each edge
+ * shouldn't. That pins the boundary to where see-through actually starts,
+ * rather than to the outer edge of some trim, edge face or shadow next to the
+ * opening — or to a thin slice beside it. A real gap scores clearly positive
+ * once the device has slid; a rectangle stuck on the wall scores about zero.
  */
 export function pairMotion(motion: MotionEvidence | undefined, a: number, b: number): { score: number; conf: number } {
   if (!motion) return { score: 0, conf: 0 };
-  const w = motion.evidence.length;
+  const E = motion.evidence;
+  const C = motion.confidence;
   const width = b - a;
-  // Stay clear of the edges themselves: they blur in and out of both regions.
-  const m = Math.max(1, Math.round(width * 0.15));
-  const fw = Math.round(clamp(width, 4, w * 0.1));
-  const inside = mean(motion.evidence, a + 1 + m, b + 1 - m);
-  const left = mean(motion.evidence, a - fw - 1, a - 1);
-  const right = mean(motion.evidence, b + 3, b + 3 + fw);
-  // Only the inside has to have been observed: a featureless wall beside a gap
-  // can't show motion either way, and simply counts as moving with the occluder.
-  const conf = mean(motion.confidence, a + 1 + m, b + 1 - m);
-  return { score: inside - Math.max(left, right), conf };
+  const k = Math.round(clamp(width * 0.25, 2, 5));
+  const m = Math.max(1, Math.round(width * 0.2));
+  const seg = (x0: number, x1: number) => ({ e: mean(E, x0, x1), c: mean(C, x0, x1) });
+  // Interior pixels are a+1..b; skip the boundary pixel itself on each side (it mixes both).
+  const core = seg(a + 1 + m, b + 1 - m);
+  const inside = [seg(a + 2, a + 2 + k), seg(b - k, b), core];
+  const outside = [seg(a - k, a), seg(b + 2, b + 2 + k)];
+  // Parts we couldn't observe (featureless) count as unknown, not as "doesn't move".
+  const seen = inside.filter((s) => s.c >= 0.2);
+  const inScore = seen.length ? Math.min(...seen.map((s) => s.e)) : 0;
+  const outScore = Math.max(0, ...outside.filter((s) => s.c >= 0.2).map((s) => s.e));
+  return { score: inScore - outScore, conf: core.c };
 }
 
 /** Measurements describing how much columns a < b look like the two sides of one gap. */
@@ -270,6 +282,7 @@ export function pairMetrics(p: EdgeProfile, a: number, b: number, motion?: Motio
   const P = p.bandPrefix;
   let dl = 0;
   let dr = 0;
+  let dlr = 0;
   for (let k = 0; k < p.bands; k++) {
     const o = k * (w + 1);
     const inner = (P[o + b + 1] - P[o + a + 1]) / width;
@@ -277,6 +290,7 @@ export function pairMetrics(p: EdgeProfile, a: number, b: number, motion?: Motio
     const right = (P[o + rx1] - P[o + b + 1]) / Math.max(1, rx1 - b - 1);
     dl += Math.abs(inner - left);
     dr += Math.abs(inner - right);
+    dlr += Math.abs(left - right);
   }
   // Use the side that differs least: both sides should differ from the inside.
   const diff = Math.min(dl, dr) / p.bands;
@@ -303,6 +317,9 @@ export function pairMetrics(p: EdgeProfile, a: number, b: number, motion?: Motio
     detail,
     moreDetail: dIn > Math.max(dL, dR),
     extent: Math.min(p.extent[a], p.extent[b]),
+    // Scaled for real lighting: both sides of a gap can be lit quite differently,
+    // but they differ far less than an opening does from its occluder.
+    sidesMatch: 1 - Math.min(1, dlr / p.bands / 80),
     innerExcess: Math.max(0, innerMax - 0.6 * weaker),
     motion: pm.score,
     motionConf: pm.conf,
@@ -327,7 +344,8 @@ function scoreFromMetrics(m: PairMetrics): number {
     0.3 * Math.abs(m.left - m.right) +
     0.4 * m.contrast +
     0.2 * m.detail +
-    0.3 * m.extent -
+    0.3 * m.extent +
+    0.4 * m.sidesMatch -
     0.5 * m.innerExcess +
     1.2 * m.motionConf * m.motion
   );
@@ -368,7 +386,8 @@ function qualityFromMetrics(p: EdgeProfile, m: PairMetrics): number {
     const parallax = clamp(0.25 + 1.5 * m.motion, 0, 1);
     evidence += clamp(m.motionConf * 1.5, 0, 1) * (parallax - evidence);
   }
-  return clamp(edge * evidence * (0.75 + 0.25 * balance) * (0.7 + 0.3 * clean) * (0.55 + 0.45 * m.extent), 0, 1);
+  const sides = 0.5 + 0.5 * m.sidesMatch;
+  return clamp(edge * evidence * (0.75 + 0.25 * balance) * (0.7 + 0.3 * clean) * (0.55 + 0.45 * m.extent) * sides, 0, 1);
 }
 
 /** Find the most plausible vertical gap in a single frame. */
