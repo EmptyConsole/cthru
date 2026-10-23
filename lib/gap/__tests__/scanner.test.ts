@@ -232,6 +232,30 @@ describe("telling real gaps from look-alikes", () => {
     expect(log.filter((l) => l.recorded && near(l.centre, OPENING)).length).toBeGreaterThan(60);
   });
 
+  it("puts the boundary where see-through starts, not on edge faces right beside the opening", () => {
+    // A 30 px opening with a dark 6 px strip against its left side and a
+    // bright 7 px strip against its right side, both fixed to the wall — like
+    // the lit edge faces of two table tops either side of a gap.
+    const world: WorldOptions = {
+      slits: [{ offset: 0, width: 30 }],
+      objects: [
+        { offset: -18, width: 6, value: 80 },
+        { offset: 18.5, width: 7, value: 245 },
+      ],
+    };
+    const scanner = new GapScanner({ width: W, height: H, colorScale: 1 });
+    const log = run(scanner, world, 160);
+    const recorded = log.filter((l) => l.recorded);
+    expect(recorded.length).toBeGreaterThan(120);
+    // Every recorded frame is centred on the opening (a slice or a strip-inclusive pair would be off-centre)…
+    expect(recorded.every((l) => near(l.centre, { offset: 0 }))).toBe(true);
+    // …and, once settled, has the opening's true edges.
+    const g = scanner.gap!;
+    const occ = pose(159).occShift;
+    expect(Math.abs(g.left + 0.5 + occ - W / 2 - -15)).toBeLessThan(2);
+    expect(Math.abs(g.right + 0.5 + occ - W / 2 - 15)).toBeLessThan(2);
+  });
+
   it("never records a gap look-alike on the wall, even while sliding", () => {
     const scanner = new GapScanner({ width: W, height: H, colorScale: 1 });
     const log = run(scanner, { objects: [STRIP] }, 150);

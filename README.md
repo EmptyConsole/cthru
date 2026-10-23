@@ -83,24 +83,40 @@ detection combines four cues:
 2. **Extent.** The share of the frame's height (6 row bands) in which each column
    holds an edge. A gap's sides usually run the full height; most rectangles
    don't.
-3. **Appearance and detail.** The inside is compared with each side in 12 bands
-   from top to bottom (brightness), plus the amount of horizontal detail. The view
-   through a gap rarely matches the occluder in both.
+3. **Appearance, detail and sides.** The inside is compared with each side in 12
+   bands from top to bottom (brightness), plus the amount of horizontal detail.
+   The view through a gap rarely matches the occluder in both. The two **sides**
+   are also compared with *each other*: just outside a real gap, on both sides, is
+   the occluder. A thin slice beside an opening (a lit edge face, a trim, a
+   shadow) has the opening on one side and the occluder on the other.
 4. **Motion: what changes.** This is the decisive cue. The frame is cut into
-   6 px vertical bands, and each is block-matched against the previous frame. The
-   median shift, with near-equal votes per band, is the occluder's motion, refined
-   to sub-pixel accuracy. A band scores high if it fits that motion badly but some
-   other shift well (it slides at a different speed: parallax), or fits no shift
-   well (new content appearing). These scores feed a per-column **parallax
-   evidence map** that is shifted with the occluder every frame, so evidence stays
-   attached to the same place on the wall. Evidence of parallax is learned
-   quickly. Evidence of *no* parallax is learned slowly, and only while something
-   else in the frame clearly moves differently, so pausing at the end of a sweep
-   doesn't erase a real gap. Columns too featureless to show motion count as
-   unobserved, not as "doesn't move".
+   6 px vertical bands, and each is block-matched against the previous frame. Each
+   band refines its own best shift to sub-pixel accuracy, and the median, with
+   near-equal votes per band, is the occluder's motion. Then **every pixel column**
+   is checked against that motion: warp the previous frame by it and measure the
+   residual, relative to the column's texture. Anything attached to the occluder
+   fits almost perfectly, however thin and however close to the gap. The view
+   through the gap, sliding at a different speed or revealing new content, doesn't.
+   Full resolution matters: with whole bands, a 6 px slice beside a gap inherited
+   the gap's motion. The per-column scores feed a **parallax evidence map** that is
+   shifted with the occluder every frame, in whole pixels with the fraction carried
+   over so it doesn't blur. That keeps evidence attached to the same place on the
+   wall. The map only learns from frames that clearly show differential motion
+   somewhere, so pausing at the end of a sweep neither erases a real gap nor builds
+   up false evidence. Columns too featureless to show motion count as unobserved,
+   not as "doesn't move".
+
+   A pair's parallax score is judged **at its boundaries**. Just inside *each* edge
+   (and in the middle) must move differently, and just outside each edge must not.
+   That puts the boundary where see-through actually starts, not on the outer edge
+   of a trim or edge face next to the opening.
 
 Pairs of strong columns are ranked on all of these, plus a mild preference for
-the centre of the frame. Once parallax has been observed, it outweighs
+the centre of the frame. While tracking, detection keeps running. If a clearly
+better candidate that overlaps or touches the tracked gap keeps winning for 5
+frames (say, the real opening next to a slice it locked onto first), the scanner
+moves to it. Candidates elsewhere in the frame are ignored, so it doesn't hop
+between gaps. Once parallax has been observed, it outweighs
 appearance: a real gap's inside moves differently from its sides, and a rectangle
 on the wall scores about zero. A candidate that stays stable and good enough for
 8 frames locks.
@@ -168,7 +184,7 @@ from wherever the new view fits.
 | `lib/gap/mosaic.ts` | Growable weighted accumulator |
 | `lib/gap/scanner.ts` | `GapScanner`: state machine tying it together, user hints |
 | `lib/gap/simulator.ts` | Synthetic fence + scene for the demo |
-| `lib/gap/__tests__/` | End-to-end tests on synthetic frames with known motion, including gap look-alikes |
+| `lib/gap/__tests__/` | End-to-end tests on synthetic frames with known motion (including gap look-alikes and edge faces right beside a gap), plus a real photo (`fixtures/door-gap.jpg`: a gap between two tables) tested as a still frame and as a sliding sequence built from it |
 | `components/GapScannerApp.tsx` | Camera/video/demo sources, overlay, controls, output |
 
 ## Limitations / next steps
