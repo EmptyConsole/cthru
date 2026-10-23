@@ -1,11 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { scanningCoach } from "@/lib/gap/coach";
 import { DEFAULT_THRESHOLD, GapScanner, rgbaToGray } from "@/lib/gap/scanner";
 import { GapSimulator } from "@/lib/gap/simulator";
 import type { ScannerStatus } from "@/lib/gap/types";
 
 type SourceKind = "none" | "camera" | "demo" | "file";
+type ThemeMode = "light" | "dark" | "auto";
+type FacingMode = "user" | "environment";
 
 /** Longest side of the frame used for the vision maths. */
 const ANALYSIS_MAX = 360;
@@ -15,9 +18,25 @@ const MAX_COLOR_SCALE = 3;
 const FRAME_BUDGET_MS = 28;
 const THRESHOLD_KEY = "seethroughgap.threshold";
 const PARALLAX_KEY = "seethroughgap.requireParallax";
+const THEME_KEY = "seethroughgap.theme";
+const ZOOM_KEY = "seethroughgap.zoom";
+const MIN_ZOOM = 1;
+const MAX_ZOOM = 4;
 
 type TorchState = { available: boolean; on: boolean };
 type CameraOption = { id: string; label: string };
+type PinchGesture = {
+  dist: number;
+  zoom: number;
+  panX: number;
+  panY: number;
+  midX: number;
+  midY: number;
+};
+
+function clamp(v: number, lo: number, hi: number) {
+  return Math.min(hi, Math.max(lo, v));
+}
 
 function loadThreshold(): number {
   try {
@@ -53,6 +72,84 @@ function saveRequireParallax(v: boolean) {
   }
 }
 
+function loadTheme(): ThemeMode {
+  try {
+    const v = localStorage.getItem(THEME_KEY);
+    if (v === "light" || v === "dark" || v === "auto") return v;
+  } catch {
+    // Storage can be unavailable.
+  }
+  return "auto";
+}
+
+function saveTheme(v: ThemeMode) {
+  try {
+    localStorage.setItem(THEME_KEY, v);
+  } catch {
+    // Not critical.
+  }
+}
+
+function applyTheme(v: ThemeMode) {
+  document.documentElement.dataset.theme = v;
+}
+
+function loadZoom(): number {
+  try {
+    const v = Number(localStorage.getItem(ZOOM_KEY));
+    if (v >= MIN_ZOOM && v <= MAX_ZOOM) return v;
+  } catch {
+    // Storage can be unavailable.
+  }
+  return 1;
+}
+
+function saveZoom(v: number) {
+  try {
+    localStorage.setItem(ZOOM_KEY, String(v));
+  } catch {
+    // Not critical.
+  }
+}
+
+/** Source rectangle for the current zoom and pan. Writes the clamped centre back into `pan`. */
+function frameCrop(fullW: number, fullH: number, zoom: number, pan: { x: number; y: number }) {
+  const z = clamp(zoom, MIN_ZOOM, MAX_ZOOM);
+  const sw = fullW / z;
+  const sh = fullH / z;
+  const sx = clamp(pan.x * fullW - sw / 2, 0, Math.max(0, fullW - sw));
+  const sy = clamp(pan.y * fullH - sh / 2, 0, Math.max(0, fullH - sh));
+  if (fullW > 0) pan.x = (sx + sw / 2) / fullW;
+  if (fullH > 0) pan.y = (sy + sh / 2) / fullH;
+  return { sx, sy, sw, sh };
+}
+
+function paintFrame(
+  ctx: CanvasRenderingContext2D,
+  src: CanvasImageSource,
+  crop: { sx: number; sy: number; sw: number; sh: number },
+  dw: number,
+  dh: number,
+  mirrorLive: boolean,
+) {
+  ctx.save();
+  if (mirrorLive) {
+    ctx.translate(dw, 0);
+    ctx.scale(-1, 1);
+  }
+  ctx.drawImage(src, crop.sx, crop.sy, crop.sw, crop.sh, 0, 0, dw, dh);
+  ctx.restore();
+}
+
+function inferFacing(track: MediaStreamTrack, requested: FacingMode): FacingMode {
+  const mode = track.getSettings().facingMode;
+  if (mode === "user" || mode === "environment") return mode;
+  const label = track.label.toLowerCase();
+  if (/front|user|face/.test(label)) return "user";
+  if (/back|rear|environment/.test(label)) return "environment";
+  return requested;
+}
+
 export default function GapScannerApp() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const viewRef = useRef<HTMLCanvasElement>(null);
@@ -74,6 +171,17 @@ export default function GapScannerApp() {
   const requireParallaxRef = useRef(true);
   const hasMosaicRef = useRef(false);
   const userScrolledAt = useRef(0);
+  const facingRef = useRef<FacingMode>("environment");
+  const liveMirrorRef = useRef(false);
+  const camerasRef = useRef<CameraOption[]>([]);
+  const zoomRef = useRef(1);
+  const panRef = useRef({ x: 0.5, y: 0.5 });
+  const cropActiveRef = useRef(false);
+  const framingChangedRef = useRef(false);
+  const pointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
+  const pinchRef = useRef<PinchGesture | null>(null);
+  const gestureRef = useRef<"none" | "drag" | "pinch">("none");
+  const cameraGen = useRef(0);
 
   const [source, setSource] = useState<SourceKind>("none");
   const [session, setSession] = useState(0);
@@ -92,12 +200,25 @@ export default function GapScannerApp() {
   const [demoAuto, setDemoAuto] = useState(true);
   const [demoPos, setDemoPos] = useState(0);
   const [frameMs, setFrameMs] = useState(0);
+  const [theme, setTheme] = useState<ThemeMode>("auto");
+  const [facing, setFacing] = useState<FacingMode>("environment");
+  const [zoom, setZoom] = useState(1);
 
+  useLayoutEffect(() => {
+    // Apply the saved theme before paint. The server render always starts on auto.
+    const mode = loadTheme();
+    applyTheme(mode);
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setTheme(mode);
+  }, []);
   useEffect(() => {
-    // Read the saved threshold after mount so server and client render the same HTML.
+    // Read saved preferences after mount so server and client render the same HTML.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setThreshold(loadThreshold());
     setRequireParallax(loadRequireParallax());
+    const z = loadZoom();
+    zoomRef.current = z;
+    setZoom(z);
   }, []);
   useEffect(() => {
     requireParallaxRef.current = requireParallax;
@@ -113,6 +234,9 @@ export default function GapScannerApp() {
   useEffect(() => {
     mirrorRef.current = mirror;
   }, [mirror]);
+  useEffect(() => {
+    camerasRef.current = cameras;
+  }, [cameras]);
   useEffect(() => {
     if (simRef.current) simRef.current.manual = demoAuto ? null : demoPos;
   }, [demoAuto, demoPos, source]);
@@ -145,6 +269,7 @@ export default function GapScannerApp() {
   // ---- Sources ------------------------------------------------------------
 
   const stopSource = useCallback(() => {
+    cameraGen.current += 1;
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
     const v = videoRef.current;
@@ -159,6 +284,7 @@ export default function GapScannerApp() {
     simRef.current = null;
     scannerRef.current = null;
     hasMosaicRef.current = false;
+    liveMirrorRef.current = false;
     setHasMosaic(false);
     setStatus(null);
     setNotice(null);
@@ -173,40 +299,63 @@ export default function GapScannerApp() {
     setSession((s) => s + 1);
   };
 
-  const startCamera = async (deviceId?: string) => {
+  const startCamera = async (deviceId?: string, requestedFacing?: FacingMode) => {
     stopSource();
     setError(null);
     if (!navigator.mediaDevices?.getUserMedia) {
       setError("This browser can't open the camera here. Camera access needs HTTPS (or localhost).");
       return;
     }
+    const facingMode = requestedFacing ?? facingRef.current;
+    const gen = cameraGen.current;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
-          ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: "environment" } }),
+          ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: facingMode } }),
           width: { ideal: 1280 },
           height: { ideal: 720 },
           frameRate: { ideal: 30 },
         },
         audio: false,
       });
+      if (gen !== cameraGen.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
       streamRef.current = stream;
       const v = videoRef.current!;
       v.srcObject = stream;
       await v.play();
+      if (gen !== cameraGen.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        if (streamRef.current === stream) streamRef.current = null;
+        return;
+      }
       const track = stream.getVideoTracks()[0];
+      const actual = inferFacing(track, facingMode);
+      facingRef.current = actual;
+      liveMirrorRef.current = actual === "user";
+      setFacing(actual);
       const caps = (track.getCapabilities?.() ?? {}) as MediaTrackCapabilities & { torch?: boolean };
       setTorch({ available: !!caps.torch, on: false });
       setCameraId(track.getSettings().deviceId ?? "");
       // Labels are only available once permission has been granted.
       const devices = await navigator.mediaDevices.enumerateDevices();
-      setCameras(
-        devices
-          .filter((d) => d.kind === "videoinput")
-          .map((d, i) => ({ id: d.deviceId, label: d.label || `Camera ${i + 1}` })),
-      );
+      if (gen !== cameraGen.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        if (streamRef.current === stream) streamRef.current = null;
+        return;
+      }
+      const options = devices
+        .filter((d) => d.kind === "videoinput")
+        .map((d, i) => ({ id: d.deviceId, label: d.label || `Camera ${i + 1}` }));
+      camerasRef.current = options;
+      setCameras(options);
       begin("camera");
     } catch (e) {
+      if (gen !== cameraGen.current) return;
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
       const name = e instanceof DOMException ? e.name : "";
       setError(
         name === "NotAllowedError"
@@ -215,6 +364,19 @@ export default function GapScannerApp() {
             ? "No camera was found. Try the demo or open a video instead."
             : `Couldn't start the camera${e instanceof Error ? `: ${e.message}` : "."}`,
       );
+    }
+  };
+
+  const flipCamera = async () => {
+    const prevId = streamRef.current?.getVideoTracks()[0]?.getSettings().deviceId ?? "";
+    const next: FacingMode = facingRef.current === "user" ? "environment" : "user";
+    const list = camerasRef.current;
+    await startCamera(undefined, next);
+    const nowId = streamRef.current?.getVideoTracks()[0]?.getSettings().deviceId ?? "";
+    if (prevId && nowId === prevId && list.length > 1) {
+      const idx = list.findIndex((c) => c.id === prevId);
+      const cycle = list[(idx + 1 + list.length) % list.length];
+      if (cycle && cycle.id !== nowId) await startCamera(cycle.id, next);
     }
   };
 
@@ -369,7 +531,7 @@ export default function GapScannerApp() {
       setHasMosaic(true);
     }
 
-    // Mini preview inside the camera view, so progress is visible while moving.
+    // Small copy of the picture, kept beside the stats so it never covers the camera.
     const mini = miniRef.current;
     if (mini) {
       const dpr = window.devicePixelRatio || 1;
@@ -447,19 +609,23 @@ export default function GapScannerApp() {
         const v = videoRef.current;
         if (!v || v.readyState < 2 || !v.videoWidth) return;
         // Skip duplicate frames (rAF can run faster than the camera).
-        if (v.currentTime === lastVideoTime && now - lastProcessAt < 100) return;
+        // While zooming, keep painting even if the camera repeats a frame.
+        if (!cropActiveRef.current && v.currentTime === lastVideoTime && now - lastProcessAt < 100) return;
         lastVideoTime = v.currentTime;
         src = v;
         sw = v.videoWidth;
         sh = v.videoHeight;
       }
       // On slow devices, drop every other frame rather than falling behind.
-      if (skipNext) {
+      // Keep drawing while the user is reframing so the crop stays live.
+      if (!cropActiveRef.current && skipNext) {
         skipNext = false;
         return;
       }
       lastProcessAt = now;
       const t0 = performance.now();
+      const crop = frameCrop(sw, sh, zoomRef.current, panRef.current);
+      if (crop.sw < 1 || crop.sh < 1) return;
 
       const key = `${sw}x${sh}`;
       if (key !== dimsKey || !scannerRef.current) {
@@ -493,8 +659,17 @@ export default function GapScannerApp() {
       const scanner = scannerRef.current!;
 
       const vctx = view.getContext("2d")!;
-      vctx.drawImage(src, 0, 0, view.width, view.height);
-      actx.drawImage(src, 0, 0, analysis.width, analysis.height);
+      const mirrorLive = liveMirrorRef.current;
+      paintFrame(vctx, src, crop, view.width, view.height, mirrorLive);
+      paintFrame(actx, src, crop, analysis.width, analysis.height, mirrorLive);
+      // The crop is changing, so don't fold these frames into the picture.
+      if (cropActiveRef.current) {
+        const ov = overlayRef.current;
+        const og = ov?.getContext("2d");
+        if (ov && og) og.clearRect(0, 0, ov.width, ov.height);
+        return;
+      }
+
       const frame = rgbaToGray(actx.getImageData(0, 0, analysis.width, analysis.height), grayBuf);
       grayBuf = frame.data;
       scanner.processFrame(frame, (a, b) => vctx.getImageData(a, 0, b - a, view.height));
@@ -534,6 +709,62 @@ export default function GapScannerApp() {
     if (scanner) setStatus(scanner.getStatus());
   };
 
+  const clearMosaicView = useCallback(() => {
+    hasMosaicRef.current = false;
+    setHasMosaic(false);
+    for (const c of [mosaicRef.current, miniRef.current]) c?.getContext("2d")?.clearRect(0, 0, c.width, c.height);
+  }, []);
+
+  const commitFraming = useCallback(() => {
+    cropActiveRef.current = false;
+    if (!framingChangedRef.current) return;
+    framingChangedRef.current = false;
+    saveZoom(zoomRef.current);
+    const hadPicture = hasMosaicRef.current;
+    scannerRef.current?.resetMosaic();
+    clearMosaicView();
+    if (hadPicture) setNotice("The framing changed, so the picture started over.");
+  }, [clearMosaicView]);
+
+  const applyZoom = useCallback((next: number, pan?: { x: number; y: number }) => {
+    const z = clamp(next, MIN_ZOOM, MAX_ZOOM);
+    let changed = Math.abs(z - zoomRef.current) > 0.001;
+    zoomRef.current = z;
+    if (z <= 1.001) {
+      if (Math.abs(panRef.current.x - 0.5) > 0.001 || Math.abs(panRef.current.y - 0.5) > 0.001) changed = true;
+      panRef.current = { x: 0.5, y: 0.5 };
+    } else if (pan) {
+      const x = clamp(pan.x, 0, 1);
+      const y = clamp(pan.y, 0, 1);
+      if (Math.abs(x - panRef.current.x) > 0.001 || Math.abs(y - panRef.current.y) > 0.001) changed = true;
+      panRef.current = { x, y };
+    }
+    if (changed) framingChangedRef.current = true;
+    setZoom((prev) => (Math.abs(prev - z) < 0.001 ? prev : z));
+  }, []);
+
+  useEffect(() => {
+    const el = overlayRef.current;
+    if (!el || source === "none") return;
+    let timer = 0;
+    const onWheel = (e: WheelEvent) => {
+      // Trackpad pinch arrives as a wheel event with the control key held.
+      // A normal scroll should still move the page.
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      cropActiveRef.current = true;
+      const factor = e.deltaY > 0 ? 0.92 : 1.08;
+      applyZoom(zoomRef.current * factor);
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => commitFraming(), 280);
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      el.removeEventListener("wheel", onWheel);
+      window.clearTimeout(timer);
+    };
+  }, [source, applyZoom, commitFraming]);
+
   const toggleLock = useCallback(() => {
     const scanner = scannerRef.current;
     if (!scanner) return;
@@ -553,12 +784,10 @@ export default function GapScannerApp() {
     const scanner = scannerRef.current;
     if (!scanner) return;
     scanner.resetMosaic();
-    hasMosaicRef.current = false;
-    setHasMosaic(false);
+    clearMosaicView();
     setNotice(null);
-    for (const c of [mosaicRef.current, miniRef.current]) c?.getContext("2d")?.clearRect(0, 0, c.width, c.height);
     setStatus(scanner.getStatus());
-  }, []);
+  }, [clearMosaicView]);
 
   const download = useCallback(() => {
     const view = scannerRef.current?.getMosaicView();
@@ -602,6 +831,14 @@ export default function GapScannerApp() {
     saveThreshold(v);
   };
 
+  const cycleTheme = () => {
+    const order: ThemeMode[] = ["auto", "light", "dark"];
+    const next = order[(order.indexOf(theme) + 1) % order.length];
+    setTheme(next);
+    applyTheme(next);
+    saveTheme(next);
+  };
+
   // Keyboard shortcuts for computers.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -637,27 +874,86 @@ export default function GapScannerApp() {
   const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (!scannerRef.current) return;
     e.currentTarget.setPointerCapture(e.pointerId);
+    pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointersRef.current.size >= 2) {
+      gestureRef.current = "pinch";
+      dragRef.current = null;
+      cropActiveRef.current = true;
+      const pts = [...pointersRef.current.values()];
+      pinchRef.current = {
+        dist: Math.max(1, Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y)),
+        zoom: zoomRef.current,
+        panX: panRef.current.x,
+        panY: panRef.current.y,
+        midX: (pts[0].x + pts[1].x) / 2,
+        midY: (pts[0].y + pts[1].y) / 2,
+      };
+      return;
+    }
+    gestureRef.current = "drag";
     const x = toAnalysisX(e);
     dragRef.current = { x0: x, x1: x };
   };
   const onPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (dragRef.current) dragRef.current.x1 = toAnalysisX(e);
-  };
-  const onPointerUp = () => {
-    const d = dragRef.current;
-    dragRef.current = null;
-    const scanner = scannerRef.current;
-    if (!d || !scanner) return;
-    if (Math.abs(d.x1 - d.x0) >= 3) {
-      scanner.setManualGap({ left: d.x0, right: d.x1 });
-      refreshStatus();
+    if (!pointersRef.current.has(e.pointerId)) return;
+    pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (gestureRef.current === "pinch" && pointersRef.current.size >= 2 && pinchRef.current) {
+      const pts = [...pointersRef.current.values()];
+      const pinch = pinchRef.current;
+      const dist = Math.max(1, Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y));
+      const midX = (pts[0].x + pts[1].x) / 2;
+      const midY = (pts[0].y + pts[1].y) / 2;
+      const rect = e.currentTarget.getBoundingClientRect();
+      const nextZoom = clamp(pinch.zoom * (dist / pinch.dist), MIN_ZOOM, MAX_ZOOM);
+      const dx = rect.width > 0 ? (midX - pinch.midX) / rect.width : 0;
+      const dy = rect.height > 0 ? (midY - pinch.midY) / rect.height : 0;
+      // Dragging the picture right moves the crop the other way. A mirrored front camera flips that.
+      const mirror = liveMirrorRef.current ? -1 : 1;
+      applyZoom(nextZoom, {
+        x: pinch.panX - (mirror * dx) / nextZoom,
+        y: pinch.panY - dy / nextZoom,
+      });
+      return;
     }
+    if (gestureRef.current === "drag" && dragRef.current) dragRef.current.x1 = toAnalysisX(e);
+  };
+  const onPointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    pointersRef.current.delete(e.pointerId);
+    if (pointersRef.current.size >= 2) return;
+    pinchRef.current = null;
+    if (pointersRef.current.size > 0) return;
+    const gesture = gestureRef.current;
+    gestureRef.current = "none";
+    if (gesture === "drag") {
+      const d = dragRef.current;
+      dragRef.current = null;
+      const scanner = scannerRef.current;
+      if (d && scanner && Math.abs(d.x1 - d.x0) >= 3) {
+        scanner.setManualGap({ left: d.x0, right: d.x1 });
+        refreshStatus();
+      }
+      return;
+    }
+    dragRef.current = null;
+    if (gesture === "pinch") commitFraming();
+  };
+  const onPointerCancel = () => {
+    pointersRef.current.clear();
+    pinchRef.current = null;
+    dragRef.current = null;
+    const gesture = gestureRef.current;
+    gestureRef.current = "none";
+    if (gesture === "pinch") commitFraming();
+    else cropActiveRef.current = false;
   };
 
   // ---- Render ---------------------------------------------------------------
 
   const tracking = status?.phase === "tracking";
   const pct = (v: number) => `${Math.round(v * 100)}%`;
+  const coach = status && source !== "none" ? scanningCoach(status) : null;
+  const themeLabel =
+    theme === "auto" ? "Theme auto. Switch to light." : theme === "light" ? "Theme light. Switch to dark." : "Theme dark. Switch to auto.";
 
   const chip = !status
     ? null
@@ -686,7 +982,6 @@ export default function GapScannerApp() {
       <ControlButton onClick={resetImage} disabled={!hasMosaic} title="C">
         Clear image
       </ControlButton>
-      {torch.available && <ControlButton onClick={toggleTorch}>{torch.on ? "Torch off" : "Torch on"}</ControlButton>}
     </>
   );
 
@@ -695,12 +990,15 @@ export default function GapScannerApp() {
       className="mx-auto flex w-full max-w-6xl flex-col gap-4 px-4 pt-4 sm:gap-5 sm:pt-8"
       style={{ paddingBottom: "max(1.5rem, env(safe-area-inset-bottom))" }}
     >
-      <header className="flex flex-col gap-1">
-        <h1 className="text-xl font-semibold tracking-tight sm:text-3xl">See Through the Gap</h1>
-        <p className="max-w-2xl text-sm text-neutral-400 sm:text-base">
-          Point your camera at a narrow vertical opening and slide sideways. Once a real gap is detected, each position
-          records a slice of what&apos;s behind it into one wide picture.
-        </p>
+      <header className="flex items-start justify-between gap-3">
+        <div className="flex min-w-0 flex-col gap-1">
+          <h1 className="text-xl font-semibold tracking-tight sm:text-3xl">See Through the Gap</h1>
+          <p className="max-w-2xl text-sm text-muted sm:text-base">
+            Point your camera at a narrow vertical opening and slide sideways. Once a real gap is detected, each position
+            records a slice of what&apos;s behind it into one wide picture.
+          </p>
+        </div>
+        <ThemeButton mode={theme} label={themeLabel} onClick={cycleTheme} />
       </header>
 
       <div className="flex flex-wrap items-center gap-2">
@@ -718,7 +1016,7 @@ export default function GapScannerApp() {
             aria-label="Camera"
             value={cameraId}
             onChange={(e) => void startCamera(e.target.value)}
-            className="h-10 max-w-[14rem] rounded-full bg-neutral-800 px-3 text-sm text-neutral-100"
+            className="h-11 max-w-[14rem] rounded-full bg-control px-3 text-sm text-foreground"
           >
             {cameras.map((c) => (
               <option key={c.id} value={c.id}>
@@ -728,7 +1026,7 @@ export default function GapScannerApp() {
           </select>
         )}
         {source !== "none" && (
-          <button onClick={stopSource} className="h-10 touch-manipulation rounded-full px-4 text-sm text-neutral-400 hover:text-neutral-100">
+          <button onClick={stopSource} className="h-11 touch-manipulation rounded-full px-4 text-sm text-faint hover:text-foreground">
             Stop
           </button>
         )}
@@ -745,71 +1043,157 @@ export default function GapScannerApp() {
         />
       </div>
 
-      {error && <p className="rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-200">{error}</p>}
-      {notice && <p className="rounded-lg border border-sky-500/40 bg-sky-500/10 px-4 py-3 text-sm text-sky-200">{notice}</p>}
+      {error && <p className="rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-foreground">{error}</p>}
+      {notice && <p className="rounded-lg border border-sky-500/40 bg-sky-500/10 px-4 py-3 text-sm text-foreground">{notice}</p>}
 
       {/* Hidden video element: the camera/file feed is drawn onto the canvas. */}
       <video ref={videoRef} muted playsInline autoPlay className="pointer-events-none absolute h-px w-px opacity-0" />
 
       <div className="flex flex-col gap-4 lg:grid lg:grid-cols-[minmax(0,1fr)_320px] lg:items-start lg:gap-6">
-        <section className="flex min-w-0 flex-col gap-3">
-          <div
-            className="relative mx-auto overflow-hidden rounded-2xl bg-neutral-900 ring-1 ring-white/10"
-            style={{ aspectRatio: `${aspect}`, width: `min(100%, calc(64dvh * ${aspect}))` }}
-          >
-            <canvas ref={viewRef} className="absolute inset-0 h-full w-full" />
-            <canvas
-              ref={overlayRef}
-              className="absolute inset-0 h-full w-full cursor-crosshair"
-              style={{ touchAction: "pan-y" }}
-              onPointerDown={onPointerDown}
-              onPointerMove={onPointerMove}
-              onPointerUp={onPointerUp}
-              onPointerCancel={() => (dragRef.current = null)}
-            />
-            {source === "none" && <EmptyState />}
-            <canvas
-              ref={miniRef}
-              className={`pointer-events-none absolute bottom-3 left-3 h-[22%] w-[38%] ${hasMosaic ? "" : "hidden"}`}
-            />
-            {chip && (
-              <span
-                className={`pointer-events-none absolute left-3 top-3 flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold shadow ${chip.cls}`}
-              >
-                {"rec" in chip && <span className="h-2 w-2 animate-pulse rounded-full bg-white" />}
-                {chip.label}
-              </span>
-            )}
-            {status && (
-              <div className="pointer-events-none absolute right-3 top-3 flex flex-col items-end gap-1.5">
-                <QualityMeter quality={status.quality} threshold={status.threshold} compact />
-                {status.rotating && (
-                  <span className="rounded-full bg-rose-500/90 px-3 py-1 text-xs font-semibold text-white shadow">
+        <section className="flex min-w-0 flex-col gap-2">
+          {source !== "none" && (
+            <div
+              className="mx-auto flex w-full flex-wrap items-center justify-between gap-2"
+              style={{ maxWidth: `calc(64dvh * ${aspect})` }}
+            >
+              <div className="flex min-w-0 flex-wrap items-center gap-2">
+                {chip && (
+                  <span className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold ${chip.cls}`}>
+                    {"rec" in chip && <span className="h-2 w-2 animate-pulse rounded-full bg-white" />}
+                    {chip.label}
+                  </span>
+                )}
+                {status?.rotating && (
+                  <span className="rounded-full bg-rose-500 px-3 py-1 text-xs font-semibold text-white">
                     Slide, don&apos;t turn
                   </span>
                 )}
               </div>
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                {status && <QualityMeter quality={status.quality} threshold={status.threshold} compact />}
+                {source === "camera" && (
+                  <>
+                    <HudButton
+                      onClick={() => void flipCamera()}
+                      label={facing === "user" ? "Switch to back camera" : "Switch to front camera"}
+                    >
+                      Flip
+                    </HudButton>
+                    {torch.available && (
+                      <HudButton onClick={() => void toggleTorch()} label={torch.on ? "Turn torch off" : "Turn torch on"}>
+                        {torch.on ? "Torch off" : "Torch"}
+                      </HudButton>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+
+          <div className="mx-auto flex w-full items-stretch justify-center gap-2">
+            <div
+              className="relative min-w-0 flex-1 overflow-hidden rounded-2xl bg-black ring-1 ring-line"
+              style={{ aspectRatio: `${aspect}`, maxWidth: `calc(64dvh * ${aspect})` }}
+            >
+              <canvas ref={viewRef} className="absolute inset-0 h-full w-full" />
+              <canvas
+                ref={overlayRef}
+                className="absolute inset-0 z-10 h-full w-full cursor-crosshair"
+                style={{ touchAction: "none" }}
+                onPointerDown={onPointerDown}
+                onPointerMove={onPointerMove}
+                onPointerUp={onPointerUp}
+                onPointerCancel={onPointerCancel}
+              />
+              {source === "none" && <EmptyState />}
+            </div>
+            {source !== "none" && (
+              <div className="hidden w-12 shrink-0 flex-col items-center gap-1 sm:flex">
+                <span className="text-[10px] font-semibold tabular-nums text-muted">{zoom.toFixed(1)}×</span>
+                <ZoomSlider
+                  zoom={zoom}
+                  vertical
+                  onStart={() => {
+                    cropActiveRef.current = true;
+                  }}
+                  onChange={applyZoom}
+                  onCommit={commitFraming}
+                />
+              </div>
             )}
           </div>
 
-          {status && <p className="text-center text-sm text-neutral-300 sm:text-base">{status.hint}</p>}
+          {source !== "none" && (
+            <label
+              className="mx-auto flex w-full items-center gap-3 sm:hidden"
+              style={{ maxWidth: `calc(64dvh * ${aspect})` }}
+            >
+              <span className="w-12 shrink-0 text-center text-xs font-semibold tabular-nums text-muted">
+                {zoom.toFixed(1)}×
+              </span>
+              <ZoomSlider
+                zoom={zoom}
+                onStart={() => {
+                  cropActiveRef.current = true;
+                }}
+                onChange={applyZoom}
+                onCommit={commitFraming}
+              />
+            </label>
+          )}
+
+          {coach && (
+            <p className="text-center">
+              <span
+                className={`inline-block rounded-full px-4 py-1.5 text-base font-semibold tracking-tight ${
+                  coach.id === "stable"
+                    ? "bg-sky-400 text-sky-950"
+                    : coach.id === "better"
+                      ? "bg-orange-400 text-orange-950"
+                      : "bg-amber-400 text-amber-950"
+                }`}
+              >
+                {coach.text}
+              </span>
+            </p>
+          )}
+
+          {status && source !== "none" && (
+            <div
+              className="mx-auto flex w-full flex-col gap-2 sm:flex-row sm:items-center"
+              style={{ maxWidth: `calc(64dvh * ${aspect})` }}
+            >
+              <canvas
+                ref={miniRef}
+                className={`h-14 w-24 shrink-0 self-start rounded-lg bg-black sm:self-auto ${hasMosaic ? "" : "hidden"}`}
+              />
+              <dl className="grid min-w-0 flex-1 grid-cols-4 gap-1 rounded-xl bg-surface px-2 py-2 text-center ring-1 ring-line">
+                <OverlayStat label="Edge" title="Edge strength" value={pct(status.confidence)} />
+                <OverlayStat label="Match" title="Match with the picture so far" value={status.matchScore === null ? "–" : pct(Math.max(0, status.matchScore))} />
+                <OverlayStat label="Width" title="Width revealed" value={`${status.coverage.toFixed(1)}×`} />
+                <OverlayStat label="Frames" title="Frames recorded" value={String(status.framesUsed)} />
+              </dl>
+            </div>
+          )}
+
+          {status && <p className="text-center text-sm text-muted sm:text-base">{status.hint}</p>}
 
           {source !== "none" && <div className="flex flex-wrap items-center justify-center gap-2 lg:hidden">{controls}</div>}
         </section>
 
         <aside className="flex flex-col gap-4">
-          <section className="flex flex-col gap-3 rounded-2xl bg-neutral-900 p-4 ring-1 ring-white/10">
+          <section className="flex flex-col gap-3 rounded-2xl bg-surface p-4 ring-1 ring-line">
             <div className="flex items-baseline justify-between">
-              <h2 className="text-sm font-semibold text-neutral-100">Recording trigger</h2>
-              <span className="text-xs text-neutral-500">
+              <h2 className="text-sm font-semibold text-foreground">Recording trigger</h2>
+              <span className="text-xs text-faint">
                 {status?.recording ? "recording" : status?.phase === "tracking" ? "waiting" : "searching"}
               </span>
             </div>
             <QualityMeter quality={status?.quality ?? 0} threshold={threshold} />
-            <label className="flex flex-col gap-2 text-sm text-neutral-300">
+            <label className="flex flex-col gap-2 text-sm text-muted">
               <span className="flex justify-between">
                 <span>Start recording at gap quality</span>
-                <span className="font-semibold tabular-nums text-neutral-100">≥ {pct(threshold)}</span>
+                <span className="font-semibold tabular-nums text-foreground">≥ {pct(threshold)}</span>
               </span>
               <input
                 type="range"
@@ -820,12 +1204,12 @@ export default function GapScannerApp() {
                 onChange={(e) => changeThreshold(Number(e.target.value))}
                 className="h-8 w-full touch-manipulation accent-emerald-400"
               />
-              <span className="flex justify-between text-xs text-neutral-500">
+              <span className="flex justify-between text-xs text-faint">
                 <span>Lenient</span>
                 <span>Strict</span>
               </span>
             </label>
-            <label className="flex items-start gap-2 text-sm text-neutral-300">
+            <label className="flex items-start gap-2 text-sm text-muted">
               <input
                 type="checkbox"
                 className="mt-1"
@@ -834,7 +1218,7 @@ export default function GapScannerApp() {
               />
               <span>
                 Wait for parallax
-                <span className="block text-xs text-neutral-500">
+                <span className="block text-xs text-faint">
                   Only record once sliding shows the view through the gap shifting against its edges. This rejects
                   things on the wall that just look like gaps.
                 </span>
@@ -842,14 +1226,14 @@ export default function GapScannerApp() {
             </label>
             {status && (status.phase === "tracking" || status.candidate) && (
               <div className="flex items-center justify-between text-xs">
-                <span className="text-neutral-400">Parallax</span>
+                <span className="text-muted">Parallax</span>
                 <span
                   className={
                     status.parallaxConfirmed
-                      ? "font-semibold text-emerald-300"
+                      ? "font-semibold text-good"
                       : status.parallaxConf > 0.3 && status.parallax < 0.1
-                        ? "font-semibold text-rose-300"
-                        : "text-sky-300"
+                        ? "font-semibold text-danger"
+                        : "text-info"
                   }
                 >
                   {status.parallaxConfirmed
@@ -860,7 +1244,7 @@ export default function GapScannerApp() {
                 </span>
               </div>
             )}
-            <p className="text-xs leading-relaxed text-neutral-500">
+            <p className="text-xs leading-relaxed text-faint">
               Quality combines straight, full-height edges, how different the view inside looks and how much detail it
               has, and (once you slide) whether it moves differently from its surroundings. Nothing is recorded until a
               gap clears this bar. Dragging across a gap records it regardless.
@@ -868,13 +1252,14 @@ export default function GapScannerApp() {
           </section>
 
           {source !== "none" && (
-            <section className="hidden flex-col gap-3 rounded-2xl bg-neutral-900 p-4 ring-1 ring-white/10 lg:flex">
+            <section className="hidden flex-col gap-3 rounded-2xl bg-surface p-4 ring-1 ring-line lg:flex">
               <div className="grid grid-cols-2 gap-2">{controls}</div>
-              <label className="flex items-center gap-2 text-sm text-neutral-400">
+              <label className="flex items-center gap-2 text-sm text-muted">
                 <input type="checkbox" checked={debug} onChange={(e) => setDebug(e.target.checked)} />
                 Show edge graph
               </label>
-              <p className="text-xs text-neutral-500">
+              {debug && <p className="text-xs tabular-nums text-faint">{frameMs.toFixed(1)} ms/frame</p>}
+              <p className="text-xs text-faint">
                 Keys: <Kbd>Space</Kbd> pause · <Kbd>R</Kbd> re-detect / record · <Kbd>C</Kbd> clear · <Kbd>[</Kbd>
                 <Kbd>]</Kbd> threshold · <Kbd>P</Kbd> parallax · <Kbd>M</Kbd> mirror · <Kbd>S</Kbd> save
               </p>
@@ -882,20 +1267,23 @@ export default function GapScannerApp() {
           )}
 
           {source !== "none" && (
-            <label className="flex items-center justify-center gap-2 text-sm text-neutral-400 lg:hidden">
-              <input type="checkbox" checked={debug} onChange={(e) => setDebug(e.target.checked)} />
-              Show edge graph
-            </label>
+            <div className="flex flex-col items-center gap-1 lg:hidden">
+              <label className="flex items-center justify-center gap-2 text-sm text-muted">
+                <input type="checkbox" checked={debug} onChange={(e) => setDebug(e.target.checked)} />
+                Show edge graph
+              </label>
+              {debug && <p className="text-xs tabular-nums text-faint">{frameMs.toFixed(1)} ms/frame</p>}
+            </div>
           )}
 
           {source === "demo" && (
-            <div className="flex flex-col gap-2 rounded-2xl bg-neutral-900 p-4 text-sm ring-1 ring-white/10">
-              <label className="flex items-center gap-2 text-neutral-300">
+            <div className="flex flex-col gap-2 rounded-2xl bg-surface p-4 text-sm ring-1 ring-line">
+              <label className="flex items-center gap-2 text-muted">
                 <input type="checkbox" checked={demoAuto} onChange={(e) => setDemoAuto(e.target.checked)} />
                 Move the virtual camera automatically
               </label>
               {!demoAuto && (
-                <label className="flex flex-col gap-1 text-neutral-400">
+                <label className="flex flex-col gap-1 text-muted">
                   Slide the virtual camera
                   <input
                     type="range"
@@ -910,16 +1298,6 @@ export default function GapScannerApp() {
               )}
             </div>
           )}
-
-          {status && tracking && (
-            <dl className="grid grid-cols-2 gap-2 text-center text-xs text-neutral-400 sm:grid-cols-4 lg:grid-cols-2">
-              <Stat label="Edge strength" value={pct(status.confidence)} />
-              <Stat label="Match" value={status.matchScore === null ? "–" : pct(Math.max(0, status.matchScore))} />
-              <Stat label="Width revealed" value={`${status.coverage.toFixed(1)}× gap`} />
-              <Stat label="Frames recorded" value={String(status.framesUsed)} />
-              {debug && <Stat label="Processing" value={`${frameMs.toFixed(1)} ms/frame`} />}
-            </dl>
-          )}
         </aside>
       </div>
 
@@ -928,7 +1306,7 @@ export default function GapScannerApp() {
           <h2 className="text-lg font-semibold">What&apos;s behind the gap</h2>
           <div className="flex items-center gap-2">
             <label
-              className="flex items-center gap-2 text-sm text-neutral-400"
+              className="flex items-center gap-2 text-sm text-muted"
               title="The image already has the scene's real orientation. Flip it only if you need the mirror view."
             >
               <input type="checkbox" checked={mirror} onChange={(e) => setMirror(e.target.checked)} />
@@ -941,7 +1319,7 @@ export default function GapScannerApp() {
         </div>
         <div
           ref={mosaicScrollRef}
-          className="relative overflow-x-auto rounded-2xl bg-[repeating-conic-gradient(#171717_0%_25%,#1f1f1f_0%_50%)] bg-[length:24px_24px] ring-1 ring-white/10"
+          className="relative overflow-x-auto rounded-2xl bg-[repeating-conic-gradient(var(--checker-a)_0%_25%,var(--checker-b)_0%_50%)] bg-[length:24px_24px] ring-1 ring-line"
           onPointerDown={() => (userScrolledAt.current = performance.now())}
           onWheel={() => (userScrolledAt.current = performance.now())}
           onTouchMove={() => (userScrolledAt.current = performance.now())}
@@ -952,7 +1330,7 @@ export default function GapScannerApp() {
             style={{ width: "auto", transform: mirror ? "scaleX(-1)" : undefined }}
           />
           {!hasMosaic && (
-            <p className="px-4 py-12 text-center text-sm text-neutral-500">
+            <p className="px-4 py-12 text-center text-sm text-faint">
               The picture builds up here once a gap is detected and you slide the device sideways.
             </p>
           )}
@@ -968,7 +1346,7 @@ function QualityMeter({ quality, threshold, compact }: { quality: number; thresh
   const good = quality >= threshold;
   return (
     <div
-      className={compact ? "flex items-center gap-2 rounded-full bg-black/55 px-2.5 py-1 shadow" : "flex flex-col gap-1.5"}
+      className={compact ? "flex items-center gap-2 rounded-full bg-surface px-2.5 py-1 text-foreground ring-1 ring-line" : "flex flex-col gap-1.5"}
       role="meter"
       aria-label="Gap quality"
       aria-valuemin={0}
@@ -977,20 +1355,20 @@ function QualityMeter({ quality, threshold, compact }: { quality: number; thresh
     >
       {!compact && (
         <div className="flex justify-between text-sm">
-          <span className="text-neutral-300">Gap quality</span>
-          <span className={`font-semibold tabular-nums ${good ? "text-emerald-300" : "text-amber-300"}`}>
+          <span className="text-muted">Gap quality</span>
+          <span className={`font-semibold tabular-nums ${good ? "text-good" : "text-warn"}`}>
             {Math.round(quality * 100)}%
           </span>
         </div>
       )}
-      <div className={`relative overflow-hidden rounded-full bg-white/15 ${compact ? "h-1.5 w-16 sm:w-24" : "h-2.5 w-full"}`}>
+      <div className={`relative overflow-hidden rounded-full ${compact ? "h-1.5 w-16 bg-meter sm:w-24" : "h-2.5 w-full bg-meter"}`}>
         <div
           className={`h-full rounded-full transition-[width] duration-150 ${good ? "bg-emerald-400" : "bg-amber-400"}`}
           style={{ width: `${Math.round(quality * 100)}%` }}
         />
-        <div className="absolute inset-y-0 w-0.5 bg-white" style={{ left: `${threshold * 100}%` }} />
+        <div className="absolute inset-y-0 w-0.5 bg-foreground" style={{ left: `${threshold * 100}%` }} />
       </div>
-      {compact && <span className="text-[11px] font-semibold tabular-nums text-white">{Math.round(quality * 100)}%</span>}
+      {compact && <span className="text-[11px] font-semibold tabular-nums text-foreground">{Math.round(quality * 100)}%</span>}
     </div>
   );
 }
@@ -999,8 +1377,8 @@ function SourceButton({ active, onClick, children }: { active: boolean; onClick:
   return (
     <button
       onClick={onClick}
-      className={`h-10 touch-manipulation rounded-full px-4 text-sm font-medium transition-colors ${
-        active ? "bg-emerald-400 text-emerald-950" : "bg-neutral-800 text-neutral-100 hover:bg-neutral-700"
+      className={`h-11 touch-manipulation rounded-full px-4 text-sm font-medium transition-colors ${
+        active ? "bg-emerald-400 text-emerald-950" : "bg-control text-foreground hover:bg-control-hover"
       }`}
     >
       {children}
@@ -1024,37 +1402,140 @@ function ControlButton({
       onClick={onClick}
       disabled={disabled}
       title={title ? `Shortcut: ${title}` : undefined}
-      className="min-h-11 touch-manipulation rounded-lg bg-neutral-800 px-3 py-2 text-sm font-medium text-neutral-100 transition-colors hover:bg-neutral-700 disabled:cursor-not-allowed disabled:opacity-40"
+      className="min-h-11 touch-manipulation rounded-lg bg-control px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-control-hover disabled:cursor-not-allowed disabled:opacity-40"
     >
       {children}
     </button>
   );
 }
 
-function Kbd({ children }: { children: React.ReactNode }) {
-  return <kbd className="rounded bg-neutral-800 px-1.5 py-0.5 font-mono text-[11px] text-neutral-300">{children}</kbd>;
+function HudButton({ onClick, label, children }: { onClick: () => void; label: string; children: React.ReactNode }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={label}
+      className="flex h-11 touch-manipulation items-center justify-center rounded-full bg-black/55 px-3 text-sm font-semibold text-white shadow focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+    >
+      {children}
+    </button>
+  );
 }
 
-function Stat({ label, value }: { label: string; value: string }) {
+function ThemeButton({ mode, label, onClick }: { mode: ThemeMode; label: string; onClick: () => void }) {
+  const name = mode === "auto" ? "Auto" : mode === "light" ? "Light" : "Dark";
   return (
-    <div className="rounded-lg bg-neutral-900 px-2 py-2 ring-1 ring-white/5">
-      <dt>{label}</dt>
-      <dd className="text-sm font-semibold tabular-nums text-neutral-100">{value}</dd>
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={label}
+      className="inline-flex h-11 shrink-0 touch-manipulation items-center gap-2 rounded-full bg-control px-3 text-sm font-medium text-foreground hover:bg-control-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-400"
+    >
+      <ThemeIcon mode={mode} />
+      {name}
+    </button>
+  );
+}
+
+function ThemeIcon({ mode }: { mode: ThemeMode }) {
+  if (mode === "light") {
+    return (
+      <svg viewBox="0 0 24 24" className="h-4 w-4" aria-hidden>
+        <circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" strokeWidth="2" />
+        <path
+          d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+        />
+      </svg>
+    );
+  }
+  if (mode === "dark") {
+    return (
+      <svg viewBox="0 0 24 24" className="h-4 w-4" aria-hidden>
+        <path
+          d="M21 14.5A8.5 8.5 0 1 1 9.5 3 7 7 0 0 0 21 14.5z"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinejoin="round"
+        />
+      </svg>
+    );
+  }
+  return (
+    <svg viewBox="0 0 24 24" className="h-4 w-4" aria-hidden>
+      <circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" strokeWidth="2" />
+      <path d="M12 4a8 8 0 0 0 0 16z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function Kbd({ children }: { children: React.ReactNode }) {
+  return <kbd className="rounded bg-control px-1.5 py-0.5 font-mono text-[11px] text-muted">{children}</kbd>;
+}
+
+function ZoomSlider({
+  zoom,
+  vertical,
+  onStart,
+  onChange,
+  onCommit,
+}: {
+  zoom: number;
+  vertical?: boolean;
+  onStart: () => void;
+  onChange: (zoom: number) => void;
+  onCommit: () => void;
+}) {
+  return (
+    <input
+      aria-label="Zoom"
+      title="Zoom and crop the scanned area. Pinch to zoom, and drag with two fingers to move."
+      type="range"
+      min={MIN_ZOOM}
+      max={MAX_ZOOM}
+      step={0.05}
+      value={zoom}
+      onPointerDown={onStart}
+      onChange={(e) => onChange(Number(e.target.value))}
+      onPointerUp={onCommit}
+      onPointerCancel={onCommit}
+      onKeyDown={onStart}
+      onKeyUp={onCommit}
+      onBlur={onCommit}
+      className={
+        vertical
+          ? "w-11 min-h-28 flex-1 cursor-pointer touch-none accent-emerald-400"
+          : "h-11 min-w-0 flex-1 cursor-pointer touch-none accent-emerald-400"
+      }
+      style={vertical ? { writingMode: "vertical-lr", direction: "rtl" } : undefined}
+    />
+  );
+}
+
+function OverlayStat({ label, value, title }: { label: string; value: string; title: string }) {
+  return (
+    <div className="min-w-0" title={title}>
+      <dt className="truncate text-[10px] font-medium text-faint">{label}</dt>
+      <dd className="truncate text-xs font-semibold tabular-nums text-foreground sm:text-sm">{value}</dd>
     </div>
   );
 }
 
 function EmptyState() {
   return (
-    <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 p-6 text-center">
-      <svg viewBox="0 0 120 80" className="h-20 w-28 text-neutral-600" aria-hidden>
+    <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-surface p-6 text-center">
+      <svg viewBox="0 0 120 80" className="h-20 w-28 text-faint" aria-hidden>
         <rect x="8" y="6" width="44" height="68" rx="3" fill="currentColor" />
         <rect x="68" y="6" width="44" height="68" rx="3" fill="currentColor" />
         <rect x="52" y="6" width="16" height="68" fill="#34d399" opacity="0.35" />
       </svg>
-      <p className="max-w-xs text-sm text-neutral-400">
-        Choose <strong className="text-neutral-200">Use camera</strong> to scan a real gap, or{" "}
-        <strong className="text-neutral-200">Try the demo</strong> to see a simulated one.
+      <p className="max-w-xs text-sm text-muted">
+        Choose <strong className="text-foreground">Use camera</strong> to scan a real gap, or{" "}
+        <strong className="text-foreground">Try the demo</strong> to see a simulated one.
       </p>
     </div>
   );
@@ -1062,8 +1543,8 @@ function EmptyState() {
 
 function HowItWorks() {
   return (
-    <details className="rounded-2xl bg-neutral-900 px-5 py-4 text-sm text-neutral-300 ring-1 ring-white/10">
-      <summary className="cursor-pointer select-none font-semibold text-neutral-100">How it works and tips</summary>
+    <details className="rounded-2xl bg-surface px-5 py-4 text-sm text-muted ring-1 ring-line">
+      <summary className="cursor-pointer select-none font-semibold text-foreground">How it works and tips</summary>
       <div className="mt-4 grid gap-6 md:grid-cols-[1fr_280px]">
         <div className="flex flex-col gap-3">
           <p>
@@ -1092,6 +1573,8 @@ function HowItWorks() {
             <li>Slide sideways at a steady distance. Turning on the spot shows nothing new.</li>
             <li>Move slowly, and sweep back and forth to fill in and clean up the picture.</li>
             <li>If auto-detection picks the wrong thing, drag across the gap in the camera view.</li>
+            <li>Use the zoom slider or pinch to scan only part of the frame. Drag with two fingers to move that crop.</li>
+            <li>On a phone, Flip switches between the back and front cameras.</li>
             <li>Dark gaps work better with the torch on.</li>
           </ul>
         </div>
@@ -1102,7 +1585,7 @@ function HowItWorks() {
           <text x="240" y="44" textAnchor="middle" fontSize="10" fill="#c4b5fd">right part</text>
           <rect x="10" y="96" width="118" height="10" fill="#a16207" />
           <rect x="152" y="96" width="118" height="10" fill="#a16207" />
-          <text x="140" y="122" textAnchor="middle" fontSize="10" fill="#a3a3a3">gap</text>
+          <text x="140" y="122" textAnchor="middle" fontSize="10" fill="currentColor">gap</text>
           <polygon points="128,101 152,101 105,28 58,28" fill="#34d399" opacity="0.15" />
           <polygon points="128,101 152,101 222,28 175,28" fill="#fbbf24" opacity="0.15" />
           <polyline points="200,176 128,101 58,28" fill="none" stroke="#34d399" strokeWidth="1.5" />

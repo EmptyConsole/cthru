@@ -63,5 +63,9 @@ export interface ScannerStatus {
   parallaxConfirmed: boolean;
   /** Recording is held back until parallax is confirmed. */
   awaitingParallax: boolean;
+  /** Width of the tracked or candidate gap as a fraction of the frame. 0 when none. */
+  gapWidthFrac: number;
+  /** Edges are being lost, the device is turning, or the gap jumps without a sideways reveal. */
+  unstable: boolean;
   hint: string;
 }
