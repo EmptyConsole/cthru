@@ -20,6 +20,9 @@ export interface RGBAImage {
 export interface Gap {
   left: number;
   right: number;
+  /** Optional vertical extent [top, bottom] (rows). Absent = the full frame height. */
+  top?: number;
+  bottom?: number;
 }
 
 export type Phase = "searching" | "tracking";
@@ -63,5 +66,9 @@ export interface ScannerStatus {
   parallaxConfirmed: boolean;
   /** Recording is held back until parallax is confirmed. */
   awaitingParallax: boolean;
+  /** Which detector finds the gap. */
+  mode: "depth" | "edges";
+  /** Gap candidates in the latest depth result. */
+  depthCandidates: number;
   hint: string;
 }

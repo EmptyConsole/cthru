@@ -1,11 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { DEFAULT_THRESHOLD, GapScanner, rgbaToGray } from "@/lib/gap/scanner";
+import { DepthClient, type DepthResult, type DepthStatus } from "@/lib/depth/client";
+import { findDepthGaps } from "@/lib/gap/depthGap";
+import { DEFAULT_THRESHOLD, GapScanner, rgbaToGray, type DetectorMode } from "@/lib/gap/scanner";
 import { GapSimulator } from "@/lib/gap/simulator";
-import type { ScannerStatus } from "@/lib/gap/types";
+import type { Gap, ScannerStatus } from "@/lib/gap/types";
 
-type SourceKind = "none" | "camera" | "demo" | "file";
+type SourceKind = "none" | "camera" | "demo" | "file" | "image";
 
 /** Longest side of the frame used for the vision maths. */
 const ANALYSIS_MAX = 360;
@@ -14,7 +16,16 @@ const MAX_COLOR_SCALE = 3;
 /** If processing a frame takes longer than this (ms, smoothed), skip every other frame. */
 const FRAME_BUDGET_MS = 28;
 const THRESHOLD_KEY = "seethroughgap.threshold";
-const PARALLAX_KEY = "seethroughgap.requireParallax";
+// v2: with depth detection, the parallax check is an optional extra and defaults to off.
+const PARALLAX_KEY = "seethroughgap.requireParallax.v2";
+const DETECTOR_KEY = "seethroughgap.detector";
+const DEPTH_SIZE_KEY = "seethroughgap.depthSize";
+/** Longest side of the image given to the depth model: speed vs detail. */
+const DEPTH_SIZES = [
+  { value: 252, label: "Fast" },
+  { value: 336, label: "Balanced" },
+  { value: 448, label: "Detailed" },
+] as const;
 
 type TorchState = { available: boolean; on: boolean };
 type CameraOption = { id: string; label: string };
@@ -37,17 +48,17 @@ function saveThreshold(v: number) {
   }
 }
 
-function loadRequireParallax(): boolean {
+function loadSetting(key: string): string | null {
   try {
-    return localStorage.getItem(PARALLAX_KEY) !== "false";
+    return localStorage.getItem(key);
   } catch {
-    return true;
+    return null;
   }
 }
 
-function saveRequireParallax(v: boolean) {
+function saveSetting(key: string, value: string) {
   try {
-    localStorage.setItem(PARALLAX_KEY, String(v));
+    localStorage.setItem(key, value);
   } catch {
     // Not critical.
   }
@@ -66,12 +77,18 @@ export default function GapScannerApp() {
   const simRef = useRef<GapSimulator | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const fileUrlRef = useRef<string | null>(null);
+  const imageRef = useRef<ImageBitmap | null>(null);
+  const depthRef = useRef<DepthClient | null>(null);
+  /** Latest depth map for the overlay. */
+  const depthVisRef = useRef<{ canvas: HTMLCanvasElement; frameId: number } | null>(null);
+  const detectorRef = useRef<DetectorMode>("depth");
+  const showDepthRef = useRef(false);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const dragRef = useRef<{ x0: number; x1: number } | null>(null);
   const debugRef = useRef(false);
   const mirrorRef = useRef(false);
   const thresholdRef = useRef(DEFAULT_THRESHOLD);
-  const requireParallaxRef = useRef(true);
+  const requireParallaxRef = useRef(false);
   const hasMosaicRef = useRef(false);
   const userScrolledAt = useRef(0);
 
@@ -84,7 +101,11 @@ export default function GapScannerApp() {
   const [mirror, setMirror] = useState(false);
   const [debug, setDebug] = useState(false);
   const [threshold, setThreshold] = useState(DEFAULT_THRESHOLD);
-  const [requireParallax, setRequireParallax] = useState(true);
+  const [requireParallax, setRequireParallax] = useState(false);
+  const [detector, setDetector] = useState<DetectorMode>("depth");
+  const [depthSize, setDepthSize] = useState<number>(336);
+  const [depthStatus, setDepthStatus] = useState<DepthStatus | null>(null);
+  const [showDepth, setShowDepth] = useState(false);
   const [torch, setTorch] = useState<TorchState>({ available: false, on: false });
   const [cameras, setCameras] = useState<CameraOption[]>([]);
   const [cameraId, setCameraId] = useState<string>("");
@@ -97,7 +118,44 @@ export default function GapScannerApp() {
     // Read the saved threshold after mount so server and client render the same HTML.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setThreshold(loadThreshold());
-    setRequireParallax(loadRequireParallax());
+    setRequireParallax(loadSetting(PARALLAX_KEY) === "true");
+    const d = loadSetting(DETECTOR_KEY);
+    if (d === "depth" || d === "edges") setDetector(d);
+    const size = Number(loadSetting(DEPTH_SIZE_KEY));
+    if (DEPTH_SIZES.some((o) => o.value === size)) setDepthSize(size);
+  }, []);
+  useEffect(() => {
+    detectorRef.current = detector;
+    const sc = scannerRef.current;
+    if (sc && sc.mode !== detector) {
+      sc.mode = detector;
+      sc.unlock();
+    }
+    if (detector === "depth" && source !== "none") depthRef.current?.start();
+  }, [detector, source]);
+  useEffect(() => {
+    if (depthRef.current) depthRef.current.longSide = depthSize;
+  }, [depthSize]);
+  useEffect(() => {
+    showDepthRef.current = showDepth;
+  }, [showDepth]);
+
+  // The depth model lives in a worker for the page's lifetime (it takes a while to load).
+  useEffect(() => {
+    const client = new DepthClient();
+    depthRef.current = client;
+    client.onStatus = (st) => setDepthStatus({ ...st });
+    client.onResult = (r: DepthResult) => {
+      const sc = scannerRef.current;
+      if (sc && sc.mode === "depth") {
+        sc.submitDepth({ frameId: r.frameId, width: r.width, height: r.height, gaps: r.gaps });
+      }
+      if (showDepthRef.current) depthVisRef.current = { canvas: depthToCanvas(r), frameId: r.frameId };
+    };
+    return () => {
+      client.dispose();
+      depthRef.current = null;
+    };
   }, []);
   useEffect(() => {
     requireParallaxRef.current = requireParallax;
@@ -156,6 +214,9 @@ export default function GapScannerApp() {
     }
     if (fileUrlRef.current) URL.revokeObjectURL(fileUrlRef.current);
     fileUrlRef.current = null;
+    imageRef.current?.close();
+    imageRef.current = null;
+    depthVisRef.current = null;
     simRef.current = null;
     scannerRef.current = null;
     hasMosaicRef.current = false;
@@ -171,6 +232,7 @@ export default function GapScannerApp() {
   const begin = (kind: SourceKind) => {
     setSource(kind);
     setSession((s) => s + 1);
+    if (detectorRef.current === "depth") depthRef.current?.start();
   };
 
   const startCamera = async (deviceId?: string) => {
@@ -228,6 +290,16 @@ export default function GapScannerApp() {
   const startFile = async (file: File) => {
     stopSource();
     setError(null);
+    if (file.type.startsWith("image/")) {
+      // A still photo: handy for checking what the detector finds in a shot.
+      try {
+        imageRef.current = await createImageBitmap(file);
+        begin("image");
+      } catch {
+        setError("Couldn't open that image.");
+      }
+      return;
+    }
     const url = URL.createObjectURL(file);
     fileUrlRef.current = url;
     const v = videoRef.current!;
@@ -240,6 +312,18 @@ export default function GapScannerApp() {
       setError("Couldn't play that video file.");
     }
   };
+
+  // `?photo=<url>` opens a still photo straight away (handy for testing the detector on a shot).
+  useEffect(() => {
+    const url = new URLSearchParams(window.location.search).get("photo");
+    if (!url) return;
+    fetch(url)
+      .then((r) => r.blob())
+      .then((b) => startFile(new File([b], "photo", { type: b.type || "image/jpeg" })))
+      .catch(() => setError("Couldn't load the photo from the URL."));
+    // Only on first load.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const toggleTorch = async () => {
     const track = streamRef.current?.getVideoTracks()[0];
@@ -268,51 +352,82 @@ export default function GapScannerApp() {
     const g = ov.getContext("2d")!;
     g.clearRect(0, 0, cw, ch);
     const sx = cw / scanner.width;
+    const sy = ch / scanner.height;
     // Boundaries are in pixel-centre coordinates; +0.5 converts to pixel edges.
     const X = (b: number) => (b + 0.5) * sx;
+    const Y = (b: number) => (b + 0.5) * sy;
+    const box = (gp: Gap) => ({
+      L: X(gp.left),
+      R: X(gp.right),
+      T: gp.top !== undefined ? Math.max(0, Y(gp.top)) : 0,
+      B: gp.bottom !== undefined ? Math.min(ch, Y(gp.bottom)) : ch,
+    });
+
+    // What the depth model sees (from a slightly older frame).
+    const vis = depthVisRef.current;
+    if (showDepthRef.current && vis) {
+      g.globalAlpha = 0.6;
+      g.drawImage(vis.canvas, 0, 0, cw, ch);
+      g.globalAlpha = 1;
+    }
+
+    // Every gap candidate in the latest depth result, with its quality.
+    if (scanner.mode === "depth") {
+      g.font = `${Math.round(11 * dpr)}px system-ui, sans-serif`;
+      for (const c of scanner.depthCandidates) {
+        const b = box(c);
+        g.strokeStyle = "rgba(34,211,238,0.85)";
+        g.lineWidth = 1.25 * dpr;
+        g.setLineDash([4 * dpr, 4 * dpr]);
+        g.strokeRect(b.L, b.T, b.R - b.L, b.B - b.T);
+        g.setLineDash([]);
+        const label = `${Math.round(c.quality * 100)}%`;
+        g.fillStyle = "rgba(8,47,73,0.85)";
+        g.fillRect(b.L, b.T, g.measureText(label).width + 8 * dpr, 16 * dpr);
+        g.fillStyle = "#a5f3fc";
+        g.fillText(label, b.L + 4 * dpr, b.T + 12 * dpr);
+      }
+    }
 
     if (scanner.phase === "tracking" && scanner.gap) {
-      const L = X(scanner.gap.left);
-      const R = X(scanner.gap.right);
+      const b = box(scanner.gap);
       const live = scanner.scanning && scanner.recording;
       const awaiting = scanner.requireParallax && !scanner.parallaxConfirmed && !live;
       const color = !scanner.scanning ? "#94a3b8" : live ? "#34d399" : awaiting ? "#38bdf8" : "#fbbf24";
+      // Darken everything outside the gap.
       g.fillStyle = "rgba(0,0,0,0.45)";
-      g.fillRect(0, 0, L, ch);
-      g.fillRect(R, 0, cw - R, ch);
+      g.fillRect(0, 0, b.L, ch);
+      g.fillRect(b.R, 0, cw - b.R, ch);
+      g.fillRect(b.L, 0, b.R - b.L, b.T);
+      g.fillRect(b.L, b.B, b.R - b.L, ch - b.B);
       if (scanner.lastStrip && live) {
+        const [r0, r1] = scanner.lastStripRows ?? [0, scanner.height];
         g.fillStyle = "rgba(52,211,153,0.14)";
-        g.fillRect(X(scanner.lastStrip[0] - 1), 0, X(scanner.lastStrip[1] - 1) - X(scanner.lastStrip[0] - 1), ch);
+        g.fillRect(
+          X(scanner.lastStrip[0] - 1),
+          Y(r0 - 1),
+          X(scanner.lastStrip[1] - 1) - X(scanner.lastStrip[0] - 1),
+          Y(r1 - 1) - Y(r0 - 1),
+        );
       }
       g.strokeStyle = color;
       g.lineWidth = 2.5 * dpr;
       g.setLineDash(live ? [] : [10 * dpr, 6 * dpr]);
-      g.beginPath();
-      g.moveTo(L, 0);
-      g.lineTo(L, ch);
-      g.moveTo(R, 0);
-      g.lineTo(R, ch);
-      g.stroke();
+      g.strokeRect(b.L, b.T, b.R - b.L, b.B - b.T);
       g.setLineDash([]);
     } else if (scanner.candidate) {
       const st = scanner.getStatus();
       const good = st.quality >= st.threshold;
-      const L = X(scanner.candidate.left);
-      const R = X(scanner.candidate.right);
+      const b = box(scanner.candidate);
       g.fillStyle = good ? "rgba(251,191,36,0.14)" : "rgba(251,146,60,0.08)";
-      g.fillRect(L, 0, R - L, ch);
+      g.fillRect(b.L, b.T, b.R - b.L, b.B - b.T);
       g.strokeStyle = good ? "#fbbf24" : "#fb923c";
       g.lineWidth = 2 * dpr;
       g.setLineDash([8 * dpr, 6 * dpr]);
-      g.beginPath();
-      g.moveTo(L, 0);
-      g.lineTo(L, ch);
-      g.moveTo(R, 0);
-      g.lineTo(R, ch);
-      g.stroke();
+      g.strokeRect(b.L, b.T, b.R - b.L, b.B - b.T);
       g.setLineDash([]);
       g.fillStyle = "#fbbf24";
-      g.fillRect(L, ch - 6 * dpr, (R - L) * st.lockProgress, 6 * dpr);
+      g.fillRect(b.L, b.B - 6 * dpr, (b.R - b.L) * st.lockProgress, 6 * dpr);
     }
 
     const drag = dragRef.current;
@@ -443,6 +558,12 @@ export default function GapScannerApp() {
         src = sim.canvas;
         sw = sim.canvas.width;
         sh = sim.canvas.height;
+      } else if (source === "image") {
+        const img = imageRef.current;
+        if (!img) return;
+        src = img;
+        sw = img.width;
+        sh = img.height;
       } else {
         const v = videoRef.current;
         if (!v || v.readyState < 2 || !v.videoWidth) return;
@@ -479,6 +600,7 @@ export default function GapScannerApp() {
           colorScale: S,
           threshold: thresholdRef.current,
           requireParallax: requireParallaxRef.current,
+          mode: detectorRef.current,
         });
         scannerRef.current = scanner;
         // Handy for inspecting the pipeline from the browser console during development.
@@ -498,6 +620,26 @@ export default function GapScannerApp() {
       const frame = rgbaToGray(actx.getImageData(0, 0, analysis.width, analysis.height), grayBuf);
       grayBuf = frame.data;
       scanner.processFrame(frame, (a, b) => vctx.getImageData(a, 0, b - a, view.height));
+      if (scanner.mode === "depth") {
+        if (source === "demo" && simRef.current) {
+          // The demo is a flat drawing, which a depth model can't judge: use the
+          // simulator's own (exact) depth instead, a few times a second.
+          if (scanner.frameIndex % 4 === 0) {
+            const d = simRef.current.depthMap(224, 168);
+            const res = findDepthGaps(d);
+            scanner.submitDepth({ frameId: scanner.frameIndex, width: d.width, height: d.height, gaps: res.gaps });
+            if (showDepthRef.current) {
+              depthVisRef.current = {
+                canvas: depthToCanvas(depthResultForVis(d, res.range)),
+                frameId: scanner.frameIndex,
+              };
+            }
+          }
+        } else {
+          // Hand this frame to the depth model if it's free (frames are dropped, not queued).
+          depthRef.current?.request(src, sw, sh, scanner.frameIndex);
+        }
+      }
 
       if (scanner.recordStarts > lastRecordStarts) {
         lastRecordStarts = scanner.recordStarts;
@@ -591,7 +733,17 @@ export default function GapScannerApp() {
     requireParallaxRef.current = v;
     if (scannerRef.current) scannerRef.current.requireParallax = v;
     setRequireParallax(v);
-    saveRequireParallax(v);
+    saveSetting(PARALLAX_KEY, String(v));
+  };
+
+  const changeDetector = (v: DetectorMode) => {
+    setDetector(v);
+    saveSetting(DETECTOR_KEY, v);
+  };
+
+  const changeDepthSize = (v: number) => {
+    setDepthSize(v);
+    saveSetting(DEPTH_SIZE_KEY, String(v));
   };
 
   const changeThreshold = (v: number) => {
@@ -615,6 +767,7 @@ export default function GapScannerApp() {
       else if (k === "c") resetImage();
       else if (k === "m") setMirror((m) => !m);
       else if (k === "p") changeRequireParallax(!requireParallaxRef.current);
+      else if (k === "v") setShowDepth((v) => !v);
       else if (k === "s") download();
       else if (k === "[" || k === "]") {
         const next = Math.round((thresholdRef.current + (k === "]" ? 0.05 : -0.05)) * 100) / 100;
@@ -658,6 +811,14 @@ export default function GapScannerApp() {
 
   const tracking = status?.phase === "tracking";
   const pct = (v: number) => `${Math.round(v * 100)}%`;
+  const depthMode = detector === "depth";
+  const depthLoading = depthMode && depthStatus?.state === "loading";
+  const depthFailed = depthMode && depthStatus?.state === "error";
+  const hint = depthFailed
+    ? "The depth model couldn't start. Switch to the classic detector, or reload to try again."
+    : depthLoading && source !== "none"
+      ? `Loading the depth model (${Math.round((depthStatus?.progress ?? 0) * 100)}%). It's downloaded once, then cached.`
+      : status?.hint;
 
   const chip = !status
     ? null
@@ -710,8 +871,8 @@ export default function GapScannerApp() {
         <SourceButton active={source === "demo"} onClick={startDemo}>
           Try the demo
         </SourceButton>
-        <SourceButton active={source === "file"} onClick={() => fileInputRef.current?.click()}>
-          Open a video
+        <SourceButton active={source === "file" || source === "image"} onClick={() => fileInputRef.current?.click()}>
+          Open a photo or video
         </SourceButton>
         {source === "camera" && cameras.length > 1 && (
           <select
@@ -735,7 +896,7 @@ export default function GapScannerApp() {
         <input
           ref={fileInputRef}
           type="file"
-          accept="video/*"
+          accept="video/*,image/*"
           className="hidden"
           onChange={(e) => {
             const f = e.target.files?.[0];
@@ -792,12 +953,94 @@ export default function GapScannerApp() {
             )}
           </div>
 
-          {status && <p className="text-center text-sm text-neutral-300 sm:text-base">{status.hint}</p>}
+          {hint && <p className="text-center text-sm text-neutral-300 sm:text-base">{hint}</p>}
 
           {source !== "none" && <div className="flex flex-wrap items-center justify-center gap-2 lg:hidden">{controls}</div>}
         </section>
 
         <aside className="flex flex-col gap-4">
+          <section className="flex flex-col gap-3 rounded-2xl bg-neutral-900 p-4 ring-1 ring-white/10">
+            <div className="flex items-baseline justify-between">
+              <h2 className="text-sm font-semibold text-neutral-100">Gap detector</h2>
+              <span className="text-xs text-neutral-500">{depthMode ? "AI depth" : "classic"}</span>
+            </div>
+            <div className="grid grid-cols-2 gap-1 rounded-lg bg-neutral-800 p-1 text-sm">
+              {(
+                [
+                  ["depth", "Depth AI"],
+                  ["edges", "Classic edges"],
+                ] as const
+              ).map(([v, label]) => (
+                <button
+                  key={v}
+                  onClick={() => changeDetector(v)}
+                  className={`min-h-9 touch-manipulation rounded-md px-2 font-medium transition-colors ${
+                    detector === v ? "bg-emerald-400 text-emerald-950" : "text-neutral-300 hover:text-neutral-100"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {depthMode && (
+              <>
+                {source === "demo" && (
+                  <p className="rounded-md bg-sky-500/10 px-2 py-1.5 text-xs text-sky-200">
+                    The demo is a flat drawing, so it uses simulated depth. The camera, photos and videos use the model.
+                  </p>
+                )}
+                <p className="text-xs leading-relaxed text-neutral-500">
+                  A depth model (Depth Anything V2) estimates how far away everything is. A gap is a narrow region
+                  that&apos;s clearly farther than the surfaces on both sides, so posters, edges and frames on the wall
+                  don&apos;t count.
+                </p>
+                <label className="flex items-center justify-between gap-2 text-sm text-neutral-300">
+                  <span>Depth detail</span>
+                  <select
+                    value={depthSize}
+                    onChange={(e) => changeDepthSize(Number(e.target.value))}
+                    className="h-9 rounded-md bg-neutral-800 px-2 text-sm text-neutral-100"
+                  >
+                    {DEPTH_SIZES.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label} ({o.value}px)
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {depthStatus?.state === "loading" && (
+                  <div className="flex flex-col gap-1 text-xs text-neutral-400">
+                    <span>Loading model… {Math.round(depthStatus.progress * 100)}%</span>
+                    <div className="h-1.5 overflow-hidden rounded-full bg-white/10">
+                      <div className="h-full bg-sky-400" style={{ width: `${Math.round(depthStatus.progress * 100)}%` }} />
+                    </div>
+                  </div>
+                )}
+                {depthStatus?.state === "ready" && (
+                  <p className="text-xs tabular-nums text-neutral-400">
+                    Model ready on {depthStatus.device === "webgpu" ? "GPU (WebGPU)" : "CPU (WebAssembly)"} ·{" "}
+                    {depthStatus.dtype}
+                    {source === "demo"
+                      ? " · idle during the demo"
+                      : ` · ${depthStatus.rate.toFixed(1)} depth maps/s · ${Math.round(depthStatus.latencyMs)} ms each`}
+                  </p>
+                )}
+                {depthFailed && (
+                  <div className="flex flex-col gap-2 rounded-lg border border-red-500/40 bg-red-500/10 p-2 text-xs text-red-200">
+                    <span>Depth model error: {depthStatus?.error}</span>
+                    <button onClick={() => changeDetector("edges")} className="self-start rounded bg-red-500/30 px-2 py-1">
+                      Use the classic detector
+                    </button>
+                  </div>
+                )}
+                <label className="flex items-center gap-2 text-sm text-neutral-400">
+                  <input type="checkbox" checked={showDepth} onChange={(e) => setShowDepth(e.target.checked)} />
+                  Show depth map <span className="text-xs text-neutral-500">(warm = near, cool = far)</span>
+                </label>
+              </>
+            )}
+          </section>
+
           <section className="flex flex-col gap-3 rounded-2xl bg-neutral-900 p-4 ring-1 ring-white/10">
             <div className="flex items-baseline justify-between">
               <h2 className="text-sm font-semibold text-neutral-100">Recording trigger</h2>
@@ -835,8 +1078,9 @@ export default function GapScannerApp() {
               <span>
                 Wait for parallax
                 <span className="block text-xs text-neutral-500">
-                  Only record once sliding shows the view through the gap shifting against its edges. This rejects
-                  things on the wall that just look like gaps.
+                  {depthMode
+                    ? "Optional extra check: also wait until sliding shows the view through the gap shifting against its edges."
+                    : "Only record once sliding shows the view through the gap shifting against its edges. This rejects things on the wall that just look like gaps."}
                 </span>
               </span>
             </label>
@@ -861,9 +1105,10 @@ export default function GapScannerApp() {
               </div>
             )}
             <p className="text-xs leading-relaxed text-neutral-500">
-              Quality combines straight, full-height edges, how different the view inside looks and how much detail it
-              has, and (once you slide) whether it moves differently from its surroundings. Nothing is recorded until a
-              gap clears this bar. Dragging across a gap records it regardless.
+              {depthMode
+                ? "Quality combines how much farther the gap is than both sides, how sharply the depth drops at its edges, how much of the height it spans, and how straight and steady it is."
+                : "Quality combines straight, full-height edges, how different the view inside looks and how much detail it has, and (once you slide) whether it moves differently from its surroundings."}{" "}
+              Nothing is recorded until a gap clears this bar. Dragging across a gap records it regardless.
             </p>
           </section>
 
@@ -876,7 +1121,7 @@ export default function GapScannerApp() {
               </label>
               <p className="text-xs text-neutral-500">
                 Keys: <Kbd>Space</Kbd> pause · <Kbd>R</Kbd> re-detect / record · <Kbd>C</Kbd> clear · <Kbd>[</Kbd>
-                <Kbd>]</Kbd> threshold · <Kbd>P</Kbd> parallax · <Kbd>M</Kbd> mirror · <Kbd>S</Kbd> save
+                <Kbd>]</Kbd> threshold · <Kbd>P</Kbd> parallax · <Kbd>V</Kbd> depth view · <Kbd>M</Kbd> mirror · <Kbd>S</Kbd> save
               </p>
             </section>
           )}
@@ -913,7 +1158,7 @@ export default function GapScannerApp() {
 
           {status && tracking && (
             <dl className="grid grid-cols-2 gap-2 text-center text-xs text-neutral-400 sm:grid-cols-4 lg:grid-cols-2">
-              <Stat label="Edge strength" value={pct(status.confidence)} />
+              <Stat label={depthMode ? "Depth score" : "Edge strength"} value={pct(status.confidence)} />
               <Stat label="Match" value={status.matchScore === null ? "–" : pct(Math.max(0, status.matchScore))} />
               <Stat label="Width revealed" value={`${status.coverage.toFixed(1)}× gap`} />
               <Stat label="Frames recorded" value={String(status.framesUsed)} />
@@ -1117,4 +1362,32 @@ function HowItWorks() {
       </div>
     </details>
   );
+}
+
+/** Shape a raw depth map like a worker result, for the overlay. */
+function depthResultForVis(d: { data: Float32Array; width: number; height: number }, range: [number, number]): DepthResult {
+  const vis = new Uint8ClampedArray(d.data.length);
+  const k = 255 / Math.max(1e-6, range[1] - range[0]);
+  for (let i = 0; i < d.data.length; i++) vis[i] = (d.data[i] - range[0]) * k;
+  return { type: "result", id: 0, frameId: 0, width: d.width, height: d.height, gaps: [], depth: vis.buffer, inferMs: 0, totalMs: 0 };
+}
+
+/** Colour-map a depth result for the overlay: near = warm, far = cool. */
+function depthToCanvas(r: DepthResult): HTMLCanvasElement {
+  const c = document.createElement("canvas");
+  c.width = r.width;
+  c.height = r.height;
+  const g = c.getContext("2d")!;
+  const img = g.createImageData(r.width, r.height);
+  const d = new Uint8ClampedArray(r.depth);
+  for (let i = 0; i < d.length; i++) {
+    const t = d[i] / 255;
+    const o = i * 4;
+    img.data[o] = 255 * Math.min(1, 1.6 * t);
+    img.data[o + 1] = 255 * (0.25 + 0.5 * Math.sin(Math.PI * t));
+    img.data[o + 2] = 255 * Math.min(1, 1.6 * (1 - t));
+    img.data[o + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  return c;
 }

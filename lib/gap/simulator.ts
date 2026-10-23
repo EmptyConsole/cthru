@@ -202,6 +202,7 @@ export class GapSimulator {
   readonly canvas: HTMLCanvasElement;
   /** -1..1 slide position when controlled manually; null = automatic sweep. */
   manual: number | null = null;
+  private lastOccShift = 0;
   private readonly ctx: CanvasRenderingContext2D;
   private readonly scene = drawScene();
   private readonly fence = drawFence();
@@ -229,6 +230,7 @@ export class GapSimulator {
     const dy = 4 * Math.sin(t * 1.7) + 2 * Math.sin(t * 4.3);
     const occShift = K_NEAR * T + turn;
     const bgShift = K_FAR * T + turn;
+    this.lastOccShift = occShift;
 
     const g = this.ctx;
     g.globalAlpha = 1;
@@ -242,5 +244,36 @@ export class GapSimulator {
     g.fillStyle = this.noise;
     g.fillRect(-128, -128, FRAME_W + 128, FRAME_H + 128);
     g.restore();
+  }
+
+  /**
+   * A simulated depth sensor for the last rendered frame (larger = nearer,
+   * like Depth Anything's output). The demo is a flat drawing, which a real
+   * depth model can't judge; the simulator knows its own geometry, so in
+   * depth mode the demo uses this instead. The fence and everything on it
+   * (the poster, the sign) are near; only the slit shows the far scene.
+   */
+  depthMap(width: number, height: number): { data: Float32Array; width: number; height: number } {
+    const data = new Float32Array(width * height);
+    const slitL = FENCE_W / 2 - SLIT_W / 2;
+    const fenceOffset = FENCE_W / 2 - FRAME_W / 2 + this.lastOccShift;
+    const cols = new Float32Array(width);
+    for (let xd = 0; xd < width; xd++) {
+      // Supersample each column for soft, model-like boundaries.
+      let far = 0;
+      for (const sub of [-0.33, 0, 0.33]) {
+        const xf = ((xd + 0.5 + sub) * FRAME_W) / width - 0.5 + fenceOffset;
+        if (xf >= slitL && xf < slitL + SLIT_W) far += 1 / 3;
+      }
+      cols[xd] = far;
+    }
+    for (let yd = 0; yd < height; yd++) {
+      for (let xd = 0; xd < width; xd++) {
+        const near = 4 + 0.15 * (xd / width) + 0.05 * Math.sin(yd * 0.7 + xd * 1.3);
+        const back = 0.7 + 0.25 * (yd / height);
+        data[yd * width + xd] = near * (1 - cols[xd]) + back * cols[xd];
+      }
+    }
+    return { data, width, height };
   }
 }

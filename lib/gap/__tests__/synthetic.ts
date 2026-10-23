@@ -138,3 +138,27 @@ export function renderWorld(p: Pose, o: WorldOptions): GrayFrame {
   }
   return { data, width: W, height: H };
 }
+
+/**
+ * What a depth model would report for `renderWorld(p, o)` (larger = nearer),
+ * at its own resolution: the wall and anything on it (posters, edge faces)
+ * are near; only the openings are far. Boundaries are slightly soft.
+ */
+export function depthWorld(p: Pose, o: WorldOptions, dw = 224, dh = 168, t = 0) {
+  const data = new Float32Array(dw * dh);
+  for (let yd = 0; yd < dh; yd++) {
+    for (let xd = 0; xd < dw; xd++) {
+      let far = 0;
+      // Supersample across the pixel for soft, realistic edges.
+      for (const sub of [-0.33, 0, 0.33]) {
+        const x = ((xd + 0.5 + sub) * W) / dw - 0.5;
+        const rel = x + p.occShift - W / 2;
+        for (const s of o.slits ?? []) if (rel >= s.offset - s.width / 2 && rel < s.offset + s.width / 2) far += 1 / 3;
+      }
+      const near = 4 + 0.05 * noise(xd / 9 + t, yd / 9);
+      const back = 0.6 + 0.15 * noise(xd / 5 + 30, yd / 5);
+      data[yd * dw + xd] = near * (1 - far) + back * far;
+    }
+  }
+  return { data, width: dw, height: dh };
+}

@@ -16,6 +16,9 @@ export interface RegistrationParams {
   /** Strip columns [x0, x1) in the frame. */
   x0: number;
   x1: number;
+  /** Strip rows [y0, y1) in the frame (default: all). */
+  y0?: number;
+  y1?: number;
   predX: number;
   predY: number;
   /** Integer search radius around the prediction. */
@@ -53,7 +56,9 @@ export function registerStrip(frame: GrayFrame, mosaic: Accumulator, p: Registra
   const ys: number[] = [];
   const vs: number[] = [];
   let mean = 0;
-  for (let y = ry + 1; y < fh - ry - 1; y += rowStep) {
+  const ya = Math.max(ry + 1, p.y0 ?? 0);
+  const yb = Math.min(fh - ry - 1, p.y1 ?? fh);
+  for (let y = ya; y < yb; y += rowStep) {
     for (let x = p.x0; x < p.x1; x++) {
       xs.push(x);
       ys.push(y);

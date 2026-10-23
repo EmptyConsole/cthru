@@ -27,21 +27,27 @@ page.
 
 1. **Use camera**, then point it at the gap with the device upright, so the gap
    runs straight up the screen.
-2. The gap is found automatically, and its **gap quality** shows top-right.
+2. The gap is found automatically by the **Depth AI** detector (the default):
+   a depth model works out how far away everything is, and the gap is the
+   narrow region that's clearly farther away than both sides of it. The first
+   time, the model (about 50 MB) downloads and is then cached. Its **gap
+   quality** shows top-right.
    Nothing is recorded until the quality clears the **recording threshold**
    (default 50%, adjustable, remembered on this device). The REC badge shows
    when it is recording. If it picks the wrong thing, drag across the gap in
    the camera view. A gap you pick by hand records whatever its quality.
-3. **Slide** the device sideways, slowly, keeping the same distance. With
-   **Wait for parallax** on (the default), recording only starts once sliding
-   shows the view through the gap shifting against its edges. That's what proves
-   it's a real opening and not a poster, frame or book on the wall. Turning on the
-   spot reveals nothing new; the app warns you if you do that.
+3. **Slide** the device sideways, slowly, keeping the same distance. Turning on
+   the spot reveals nothing new; the app warns you if you do that. (Optional:
+   **Wait for parallax** also holds recording until sliding shows the view
+   through the gap shifting against its edges.)
 4. Sweep back and forth to fill in and clean up the picture, then **Download
    PNG**.
 
-You can also load a recorded video (**Open a video**) or use the built-in
-simulated fence (**Try the demo**).
+You can also open a photo or a recorded video (**Open a photo or video**), or use
+the built-in simulated fence (**Try the demo**). The demo is a flat drawing, which
+a depth model can't judge, so in Depth AI mode it uses the simulator's own depth.
+For testing, `?photo=<url>` opens a photo directly, e.g.
+`/?photo=/samples/table-gap.jpg`.
 
 **On phones** the screen stays awake while scanning, the phone gives a short
 buzz when recording starts (where supported), the torch button appears when the
@@ -49,21 +55,59 @@ camera has one, and you can switch cameras (for example to the ultra-wide).
 **On computers** the controls sit beside the camera view, and there are keyboard
 shortcuts: <kbd>Space</kbd> pause, <kbd>R</kbd> re-detect / record,
 <kbd>C</kbd> clear, <kbd>[</kbd> <kbd>]</kbd> threshold, <kbd>P</kbd> wait for
-parallax, <kbd>M</kbd> mirror, <kbd>S</kbd> save.
+parallax, <kbd>V</kbd> depth view, <kbd>M</kbd> mirror, <kbd>S</kbd> save.
 
-Tick **Show edge graph** to see what the detector sees: pink is edge strength
-per column, and cyan is parallax evidence (where the image moves differently from
-the occluder). The demo fence has a poster and a sign on it. Both look like gaps
-to the edge detector, but they show no parallax, so they're ignored.
+Tick **Show depth map** to see what the depth model sees (warm = near, cool =
+far). Every gap candidate is outlined with its score. **Depth detail** trades
+speed against detail: Fast 252 px, Balanced 336 px, Detailed 448 px.
+**Classic edges** switches back to the older edge-and-motion detector.
 
 ## How it works
 
 ```
-frame → gray (≤360 px) ─┬─ motion vs previous frame → parallax evidence map ─┐
-                        ├─ edge / detail / extent profile ───────────────────┴→ detect / track the gap
-                        └─ strip inside the gap → register against the mosaic → accumulate
-frame → colour (≤3×)  ──────────────────────────────────────────────────────────┘
+                       ┌─ (worker) Depth Anything V2 Small → depth map → gap candidates ─┐  a few–25 / s
+frame ─────────────────┤                                                                 ▼
+  → gray (≤360 px) ────┼─ occluder motion ─────────── latency compensation, tracking ──→ gap box
+                       └─ strip inside the gap → register against the mosaic → accumulate (every frame)
+  → colour (≤3×) ────────────────────────────────────────────────────────────────────────┘
 ```
+
+**Depth detection (default)** (`lib/depth/`, `lib/gap/depthGap.ts`). A gap is,
+by definition, a narrow region much farther away than the surfaces on both
+sides. Depth Anything V2 Small (Apache-2.0, via Transformers.js) measures that
+directly. It runs in a Web Worker on the GPU (WebGPU, fp16 where supported, else
+fp32), falling back to WebAssembly with the 8-bit model. On a recent Mac it does
+about 25 depth maps per second at 336 px, about 28 ms each. From each depth map:
+
+1. Normalise robustly: the far level is the 0.5th percentile, because a gap can
+   be ~1% of the frame. The range has a floor relative to the nearest depth, so
+   a flat wall's noise isn't stretched into pretend valleys.
+2. Row by row, find **valleys**: pixels clearly farther than the nearest surface
+   within a window on their left *and* on their right. A far area beside a single
+   object, or one running off the frame, doesn't count. Each valley's true width
+   is measured by walking out to where depth returns near, and anything wider
+   than 40% of the frame is ignored.
+3. **Err small**: inside a valley, only pixels within the farthest 25% of its
+   depth count. Depth maps are soft at boundaries, and surfaces like a table's
+   edge face really are at an in-between depth.
+4. Group rows into vertical candidates. Score each on depth contrast, the share
+   of the height it covers, straightness (the centres are fitted with a line, so a
+   slight tilt is fine), width consistency, and **sharpness**. A gap's sides are
+   depth *discontinuities*; a room corner or hallway seen from inside is far in the
+   middle too, but its sides slope gradually.
+5. The box uses the inner 80th-percentile side positions across rows, so it
+   stays inside the opening, and the gap's own top and bottom.
+6. Each side may then snap **inward only** onto a strong image edge just inside
+   it, which sharpens the boundary without ever growing the box.
+
+Depth results arrive a little late. Each carries the index of the frame it came
+from, and the scanner shifts it by how far the occluder has moved since then.
+Without this, the box would be up to ~1.5 px off while moving; with it, under
+0.2 px. Between results, the box follows the occluder's motion. Locking needs 3
+agreeing results above the threshold. Four results in a row with no match mean
+the gap is lost. Only the gap's rows are stitched.
+
+The classic detector described below is still available (**Classic edges**).
 
 **Geometry.** The occluder is close and the hidden scene is further away. When
 the device slides, the near edges move across the image faster than the far
@@ -71,7 +115,7 @@ scene (parallax), so the scene slides past the opening. Sliding right reveals
 what is further *left*, the reverse of a normal panorama. Turning the device
 moves both layers equally, so it reveals nothing.
 
-**Gap detection** (`lib/gap/edges.ts`, `lib/gap/motion.ts`). Edges alone aren't
+**Classic gap detection** (`lib/gap/edges.ts`, `lib/gap/motion.ts`). Edges alone aren't
 enough: a picture frame, book, door panel or poster on a wall has two strong
 vertical edges with something different between them, just like a gap. So
 detection combines four cues:
@@ -178,25 +222,38 @@ from wherever the new view fits.
 
 | Path | What |
 | --- | --- |
+| `lib/depth/depthWorker.ts` | Web Worker: loads Depth Anything V2 Small (WebGPU / WASM), runs it, finds gap candidates |
+| `lib/depth/client.ts` | Main-thread side: one frame in flight, load progress, rate and latency |
+| `lib/gap/depthGap.ts` | Depth map → scored, err-small gap boxes; inward edge refinement |
 | `lib/gap/edges.ts` | Edge / extent / detail profile, pair scoring and quality, detection, tracking |
 | `lib/gap/motion.ts` | Dominant (occluder) motion and per-column differential motion |
 | `lib/gap/registration.ts` | NCC strip-to-mosaic registration |
 | `lib/gap/mosaic.ts` | Growable weighted accumulator |
 | `lib/gap/scanner.ts` | `GapScanner`: state machine tying it together, user hints |
 | `lib/gap/simulator.ts` | Synthetic fence + scene for the demo |
-| `lib/gap/__tests__/` | End-to-end tests on synthetic frames with known motion (including gap look-alikes and edge faces right beside a gap), plus a real photo (`fixtures/door-gap.jpg`: a gap between two tables) tested as a still frame and as a sliding sequence built from it |
+| `scripts/depth-fixture.mjs` | Runs the depth model on a photo in Node and saves the depth map as a test fixture |
+| `lib/gap/__tests__/` | Depth gap-finder tests (synthetic depth maps plus the real model's depth map of the sample photo), depth-mode scanner tests with latency, and end-to-end tests on synthetic frames with known motion (including gap look-alikes and edge faces right beside a gap), plus a real photo (`fixtures/door-gap.jpg`: a gap between two tables) tested as a still frame and as a sliding sequence built from it |
 | `components/GapScannerApp.tsx` | Camera/video/demo sources, overlay, controls, output |
 
 ## Limitations / next steps
+
+- **Depth detection** needs a real scene: the model judges depth from what it
+  sees, so very low light, motion blur or a featureless view can confuse it.
+  It's tested here on one real photo plus synthetic depth maps. Real clips of
+  gaps (especially ones that go wrong) are the most useful next test cases:
+  `node scripts/depth-fixture.mjs <photo.jpg> <out>` turns a photo into a depth
+  fixture.
+- The model is ~50 MB (fp16) on first load. Phone speed hasn't been measured yet.
+  If it's slow, pick **Fast** depth detail; the stitching runs every frame
+  regardless.
 
 - Vertical gaps only, held roughly upright (about ±1 px of tilt per row is tolerated).
 - Assumes the hidden scene is roughly flat. Objects at very different depths
   behind the gap will show parallax seams.
 - A uniform, textureless background can't be registered. The app says so.
-- Processing runs on the main thread (a few ms per frame on a laptop; tick "Show
-  edge graph" to see ms/frame). If it runs over budget, every other frame is
-  skipped. Moving it to a Web Worker with `OffscreenCanvas` would help on slower
-  phones.
+- Tracking and stitching run on the main thread (a few ms per frame on a
+  laptop; the depth model runs in its own worker). If a frame runs over budget,
+  every other frame is skipped.
 - Rotating the phone mid-scan changes the frame shape, so the scan restarts.
 - Parallax needs depth behind the gap. If what's behind sits almost flush with
   the opening, or is dark and featureless, sliding shows little or no parallax.

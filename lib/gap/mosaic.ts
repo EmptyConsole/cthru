@@ -91,6 +91,9 @@ export class Accumulator {
     offX: number,
     offY: number,
     weightScale = 1,
+    /** Source rows [srcY0, srcY1) to paint (default: all). */
+    srcY0 = 0,
+    srcY1 = Infinity,
   ): void {
     const sw = src.width;
     const sh = src.height;
@@ -122,8 +125,8 @@ export class Accumulator {
       colW[i] = (0.08 + Math.sin(Math.PI * Math.min(Math.max(t, 0), 1))) * weightScale;
     }
 
-    const v0 = Math.ceil(offY);
-    const v1 = Math.floor(sh - 1 + offY);
+    const v0 = Math.ceil(Math.max(0, srcY0) + offY);
+    const v1 = Math.floor(Math.min(sh, srcY1) - 1 + offY);
     for (let v = v0; v <= v1; v++) {
       const Y = v + oy;
       if (Y < 0 || Y >= this.height) continue;

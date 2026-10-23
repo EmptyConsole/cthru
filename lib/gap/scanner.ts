@@ -7,6 +7,7 @@ import {
   type EdgeProfile,
   type MotionEvidence,
 } from "./edges";
+import { refineGapEdges, type DepthGap } from "./depthGap";
 import { Accumulator } from "./mosaic";
 import { MotionEstimator, type MotionResult } from "./motion";
 import { registerStrip } from "./registration";
@@ -24,6 +25,29 @@ export interface ScannerOptions {
   threshold?: number;
   /** See `GapScanner.requireParallax`. Defaults to true. */
   requireParallax?: boolean;
+  /** How the gap is found. Defaults to "edges". */
+  mode?: DetectorMode;
+}
+
+/**
+ * - "depth": gaps come from a depth model (Depth Anything V2) via `submitDepth`:
+ *   a gap is a narrow region much farther away than both sides.
+ * - "edges": the classic detector (straight edges, appearance, parallax).
+ */
+export type DetectorMode = "depth" | "edges";
+
+/** A depth model's gap candidates for one frame, in depth-map pixels. */
+export interface DepthSubmission {
+  /** `GapScanner.frameIndex` of the frame the depth map was computed from. */
+  frameId: number;
+  width: number;
+  height: number;
+  gaps: DepthGap[];
+}
+
+/** A depth candidate in analysis pixels, motion-compensated to the current frame. */
+export interface DepthCandidate extends Gap {
+  quality: number;
 }
 
 /** Returns colour pixels for colour-frame columns [sx0, sx1), full height. */
@@ -51,6 +75,35 @@ const MOTION_RATE = 0.2;
 const CONFIRM_SCORE = 0.2;
 const CONFIRM_CONF = 0.25;
 const CONFIRM_FRAMES = 3;
+/** Depth results in a row that must agree (and clear the threshold) before locking. */
+const DEPTH_LOCK_HITS = 3;
+/** Depth results in a row without a match before the tracked gap counts as lost. */
+const DEPTH_LOST_AFTER = 4;
+/** Frames of occluder-motion history kept for compensating depth latency. */
+const OCC_HISTORY = 256;
+
+/** Overlap of two gaps' column ranges, as intersection over union (0..1). */
+function overlap1D(a: Gap, b: Gap): number {
+  const inter = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+  const union = Math.max(a.right, b.right) - Math.min(a.left, b.left);
+  return inter > 0 && union > 0 ? inter / union : 0;
+}
+
+function shiftGap<G extends Gap>(g: G, dx: number): G {
+  return dx === 0 ? g : { ...g, left: g.left + dx, right: g.right + dx };
+}
+
+/** Move gap `a` a fraction `k` of the way to `b`. */
+function blendGap(a: Gap, b: Gap, k: number): Gap {
+  const mix = (u: number | undefined, v: number | undefined) =>
+    u === undefined ? v : v === undefined ? u : u + k * (v - u);
+  return {
+    left: a.left + k * (b.left - a.left),
+    right: a.right + k * (b.right - a.right),
+    top: mix(a.top, b.top),
+    bottom: mix(a.bottom, b.bottom),
+  };
+}
 
 const smoothstep = (x: number, lo: number, hi: number) => {
   const t = Math.min(1, Math.max(0, (x - lo) / (hi - lo)));
@@ -103,6 +156,13 @@ export class GapScanner {
   lastProfile: EdgeProfile | null = null;
   /** Strip columns [x0, x1) used in the most recent frame. */
   lastStrip: [number, number] | null = null;
+  /** Strip rows [y0, y1) used in the most recent frame. */
+  lastStripRows: [number, number] | null = null;
+  mode: DetectorMode;
+  /** Increments every processed frame; tag depth requests with it (see `DepthSubmission.frameId`). */
+  frameIndex = 0;
+  /** Latest depth candidates (analysis px, current frame), for overlays. */
+  depthCandidates: DepthCandidate[] = [];
 
   private readonly autoLockFrames: number;
   private candidateStreak = 0;
@@ -131,6 +191,12 @@ export class GapScanner {
   private refuteStreak = 0;
   /** Frames in a row that a better, overlapping candidate beat the tracked gap. */
   private betterStreak = 0;
+  /** Running total of occluder motion (px), and its value at each recent frame. */
+  private occCum = 0;
+  private readonly occHistory = new Float64Array(OCC_HISTORY);
+  private pendingDepth: DepthSubmission | null = null;
+  private depthMisses = 0;
+  private lastDepthFrame = -1;
 
   private gray: Accumulator;
   private color: Accumulator;
@@ -159,6 +225,7 @@ export class GapScanner {
     this.autoLockFrames = opts.autoLockFrames ?? 8;
     this.threshold = opts.threshold ?? DEFAULT_THRESHOLD;
     this.requireParallax = opts.requireParallax ?? true;
+    this.mode = opts.mode ?? "edges";
     this.motionEst = new MotionEstimator(opts.width, opts.height);
     this.motionMap = { evidence: new Float32Array(opts.width), confidence: new Float32Array(opts.width) };
     this.gray = this.makeGray();
@@ -199,6 +266,8 @@ export class GapScanner {
     this.candidateStreak = 0;
     this.prevGapMid = null;
     this.lastStrip = null;
+    this.lastStripRows = null;
+    this.depthMisses = 0;
     this.resetParallax();
     if (!this.gray.isEmpty) this.needGlobal = true;
   }
@@ -240,6 +309,7 @@ export class GapScanner {
     this.candidate = null;
     this.candidateStreak = 0;
     this.lostFrames = 0;
+    this.depthMisses = 0;
     this.prevGapMid = null;
     if (!this.gray.isEmpty) this.needGlobal = true;
   }
@@ -385,8 +455,20 @@ export class GapScanner {
     }
   }
 
+  /** Hand over a depth model's result; it is applied on the next `processFrame`. */
+  submitDepth(res: DepthSubmission) {
+    this.pendingDepth = res;
+  }
+
   processFrame(frame: GrayFrame, getColorStrip: ColorStripProvider): void {
+    this.frameIndex++;
     this.updateMotion(frame);
+    this.occCum += this.occluderShift;
+    this.occHistory[this.frameIndex % OCC_HISTORY] = this.occCum;
+    if (this.mode === "depth") {
+      this.processDepthFrame(frame, getColorStrip);
+      return;
+    }
     const profile = computeEdgeProfile(frame);
     this.lastProfile = profile;
 
@@ -419,21 +501,136 @@ export class GapScanner {
       left: prev.left + a * (tr.gap.left - prev.left),
       right: prev.right + a * (tr.gap.right - prev.right),
     };
+    this.integrateGap(frame, getColorStrip);
+  }
 
-    const mid = (this.gap.left + this.gap.right) / 2;
+  /**
+   * Depth mode. Depth results arrive asynchronously (a few per second, each a
+   * little late); between them the gap simply moves with the occluder.
+   */
+  private processDepthFrame(frame: GrayFrame, getColorStrip: ColorStripProvider) {
+    // This frame's occluder motion carries the gap / candidate along.
+    if (this.gap) this.gap = shiftGap(this.gap, this.occluderShift);
+    if (this.candidate) this.candidate = shiftGap(this.candidate, this.occluderShift);
+    const pending = this.pendingDepth;
+    this.pendingDepth = null;
+    if (pending) this.applyDepth(pending, frame);
+    if (this.phase !== "tracking" || !this.gap) return;
+
+    const g = this.gap;
+    this.updateParallax([Math.round(g.left - 0.5), Math.round(g.right - 0.5)]);
+    this.updateRecording();
+    if (this.phase !== "tracking") return;
+    this.integrateGap(frame, getColorStrip);
+  }
+
+  /** Fold one depth result into the candidate (searching) or the tracked gap. */
+  private applyDepth(res: DepthSubmission, frame: GrayFrame) {
+    const age = this.frameIndex - res.frameId;
+    if (age < 0 || age >= OCC_HISTORY) return;
+    this.lastDepthFrame = this.frameIndex;
+    // The depth map shows the scene as it was `age` frames ago; the occluder
+    // (and so the gap) has moved since.
+    const shift = this.occCum - this.occHistory[res.frameId % OCC_HISTORY];
+    const sx = this.width / res.width;
+    const sy = this.height / res.height;
+    const profile = computeEdgeProfile(frame);
+    this.lastProfile = profile;
+    const cands: DepthCandidate[] = [];
+    for (const d of res.gaps) {
+      const box = {
+        left: (d.left + 0.5) * sx - 0.5 + shift,
+        right: (d.right + 0.5) * sx - 0.5 + shift,
+        top: (d.top + 0.5) * sy - 0.5,
+        bottom: (d.bottom + 0.5) * sy - 0.5,
+      };
+      // Sharpen each side onto a strong image edge just inside it (inward only).
+      const r = refineGapEdges(box, profile.coherence, 4);
+      if (r.right - r.left < 3 || r.left < 0.5 || r.right > this.width - 1.5) continue;
+      cands.push({ ...r, quality: d.quality });
+    }
+    this.depthCandidates = cands;
+
+    if (this.phase === "searching") {
+      const prev = this.candidate;
+      const centre = (c: Gap) => 1 - Math.abs((c.left + c.right) / 2 / this.width - 0.5) * 2;
+      // Mostly quality; a little preference for the centre and for staying on the current candidate.
+      const score = (c: DepthCandidate) =>
+        c.quality * (0.85 + 0.15 * centre(c)) * (prev && overlap1D(prev, c) >= 0.3 ? 1.2 : 1);
+      let best: DepthCandidate | null = null;
+      for (const c of cands) if (!best || score(c) > score(best)) best = c;
+      if (!best) {
+        this.candidate = null;
+        this.candidateStreak = 0;
+        this.quality *= 0.5;
+        this.confidence = 0;
+        return;
+      }
+      if (prev && overlap1D(prev, best) >= 0.3) {
+        this.candidate = blendGap(prev, best, 0.6);
+        this.quality += 0.5 * (best.quality - this.quality);
+      } else {
+        this.candidate = { left: best.left, right: best.right, top: best.top, bottom: best.bottom };
+        this.quality = best.quality;
+        this.candidateStreak = 0;
+        this.resetParallax();
+      }
+      this.confidence = best.quality;
+      this.candidateStreak = this.quality >= this.threshold ? this.candidateStreak + 1 : 0;
+      if (this.candidateStreak >= DEPTH_LOCK_HITS) this.lockOnto(this.candidate, false);
+      return;
+    }
+
+    // Tracking: correct the gap with the matching candidate.
+    const g = this.gap!;
+    let match: DepthCandidate | null = null;
+    let bestOv = 0.25;
+    for (const c of cands) {
+      const ov = overlap1D(g, c);
+      if (ov > bestOv) {
+        bestOv = ov;
+        match = c;
+      }
+    }
+    if (match) {
+      this.depthMisses = 0;
+      this.gap = blendGap(g, match, 0.6);
+      this.quality += 0.4 * (match.quality - this.quality);
+      this.confidence = match.quality;
+    } else {
+      this.depthMisses++;
+      this.quality *= 0.75;
+      if (!this.forced && this.depthMisses >= DEPTH_LOST_AFTER) this.unlock(true);
+    }
+  }
+
+  /** Cut the strip inside the tracked gap and add it to the picture (if recording). */
+  private integrateGap(frame: GrayFrame, getColorStrip: ColorStripProvider) {
+    const g = this.gap!;
+    const mid = (g.left + g.right) / 2;
     const gapShift = this.prevGapMid === null ? 0 : mid - this.prevGapMid;
     this.prevGapMid = mid;
 
-    const gw = this.gap.right - this.gap.left;
+    const gw = g.right - g.left;
     const margin = Math.max(1, gw * 0.15);
-    const x0 = Math.ceil(this.gap.left + margin);
-    const x1 = Math.floor(this.gap.right - margin) + 1;
-    if (x1 - x0 < 3) {
+    const x0 = Math.ceil(g.left + margin);
+    const x1 = Math.floor(g.right - margin) + 1;
+    // Rows: the gap's own extent if known (inset a little), else the full height.
+    let y0 = 0;
+    let y1 = this.height;
+    if (g.top !== undefined && g.bottom !== undefined) {
+      const vm = Math.max(1, (g.bottom - g.top) * 0.03);
+      y0 = Math.max(0, Math.ceil(g.top + vm));
+      y1 = Math.min(this.height, Math.floor(g.bottom - vm) + 1);
+    }
+    if (x1 - x0 < 3 || y1 - y0 < this.height * 0.2) {
       this.lastStrip = null;
+      this.lastStripRows = null;
       return;
     }
     this.lastStrip = [x0, x1];
-    if (this.scanning && this.recording) this.integrate(frame, getColorStrip, x0, x1, gapShift);
+    this.lastStripRows = [y0, y1];
+    if (this.scanning && this.recording) this.integrate(frame, getColorStrip, x0, x1, gapShift, y0, y1);
   }
 
   private search(profile: EdgeProfile) {
@@ -477,7 +674,15 @@ export class GapScanner {
     if (this.candidateStreak >= this.autoLockFrames) this.lockOnto(this.candidate, false);
   }
 
-  private integrate(frame: GrayFrame, getColorStrip: ColorStripProvider, x0: number, x1: number, gapShift: number) {
+  private integrate(
+    frame: GrayFrame,
+    getColorStrip: ColorStripProvider,
+    x0: number,
+    x1: number,
+    gapShift: number,
+    y0 = 0,
+    y1 = frame.height,
+  ) {
     const S = this.colorScale;
 
     if (this.gray.isEmpty) {
@@ -490,18 +695,18 @@ export class GapScanner {
         const lo = e0 - x0 - sw * 0.5;
         const hi = e1 - x1 + sw * 0.5;
         const coarse = registerStrip(frame, this.gray, {
-          x0, x1, predX: 0, predY: this.pos.y, rx: 0, ry: 6,
+          x0, x1, y0, y1, predX: 0, predY: this.pos.y, rx: 0, ry: 6,
           rangeX: [Math.min(lo, hi), Math.max(lo, hi)], rowStep: 3, stepX: 2, minScore: 0.6, minOverlap: 0.4,
         });
         reg = coarse.ok
-          ? registerStrip(frame, this.gray, { x0, x1, predX: coarse.dx, predY: coarse.dy, rx: 3, ry: 2, minScore: 0.7 })
+          ? registerStrip(frame, this.gray, { x0, x1, y0, y1, predX: coarse.dx, predY: coarse.dy, rx: 3, ry: 2, minScore: 0.7 })
           : coarse;
       } else {
         // Widen the search after each miss in case the view jumped.
         const widen = 1 + Math.min(this.regFails, 4);
         const rx = Math.min(60, Math.max(6, Math.ceil(Math.abs(this.vel) * 1.5) + 4) * widen);
         reg = registerStrip(frame, this.gray, {
-          x0, x1, predX: this.pos.x + this.vel, predY: this.pos.y, rx, ry: 3 + Math.min(this.regFails, 3),
+          x0, x1, y0, y1, predX: this.pos.x + this.vel, predY: this.pos.y, rx, ry: 3 + Math.min(this.regFails, 3),
         });
       }
       this.matchScore = reg.score;
@@ -545,12 +750,12 @@ export class GapScanner {
 
     this.posValid = true;
     const weightScale = this.matchScore === null ? 1 : Math.max(0.2, (this.matchScore - 0.5) * 2);
-    this.gray.accumulate(frame, 1, 0, x0, x1, this.pos.x, this.pos.y, weightScale);
+    this.gray.accumulate(frame, 1, 0, x0, x1, this.pos.x, this.pos.y, weightScale, y0, y1);
 
     const sx0 = Math.max(0, Math.floor(x0 * S));
     const sx1 = Math.min(this.colorWidth, Math.ceil(x1 * S) + 1);
     const strip = getColorStrip(sx0, sx1);
-    this.color.accumulate(strip, 4, sx0, x0 * S, Math.min(x1 * S, sx1), this.pos.x * S, this.pos.y * S, weightScale);
+    this.color.accumulate(strip, 4, sx0, x0 * S, Math.min(x1 * S, sx1), this.pos.x * S, this.pos.y * S, weightScale, y0 * S, y1 * S);
     this.framesUsed++;
   }
 
@@ -577,13 +782,17 @@ export class GapScanner {
     const awaitingParallax = !this.forced && this.requireParallax && !this.parallaxConfirmed;
     let hint: string;
     if (this.phase === "searching") {
-      if (this.candidate && belowThreshold) {
+      if (this.mode === "depth" && this.lastDepthFrame < 0) {
+        hint = "Waiting for the depth model…";
+      } else if (this.candidate && belowThreshold) {
         hint = `Gap found, but its quality (${pct(this.quality)}) is below the ${pct(this.threshold)} needed to record. Get closer, add light, hold it upright, or lower the threshold. Dragging across the gap also starts recording.`;
       } else if (this.candidate && awaitingParallax) {
         hint = "Found a likely gap. Slide the device sideways a little to confirm it's a real opening.";
       } else if (this.candidate) hint = "Found a good gap. Hold steady and recording will start.";
       else if (this.rejected) hint = "That gap never got clear enough to record. Looking for a better one…";
       else if (this.lostTrack) hint = "Lost the gap. Point back at it to continue the scan.";
+      else if (this.mode === "depth")
+        hint = "Looking for a gap: a narrow opening that's farther away than the surfaces either side. Hold the device upright, or drag across the gap to pick it.";
       else hint = "Point the camera at a vertical gap and hold the device upright. You can also drag across the gap to pick it.";
     } else if (!this.scanning) {
       hint = "Paused. The gap is still tracked. Press Resume to keep building the image.";
@@ -618,7 +827,10 @@ export class GapScanner {
       threshold: this.threshold,
       gap: this.gap,
       candidate: this.candidate,
-      lockProgress: this.phase === "tracking" ? 1 : Math.min(1, this.candidateStreak / this.autoLockFrames),
+      lockProgress:
+        this.phase === "tracking"
+          ? 1
+          : Math.min(1, this.candidateStreak / (this.mode === "depth" ? DEPTH_LOCK_HITS : this.autoLockFrames)),
       confidence: this.confidence,
       matchScore: this.matchScore,
       coverage,
@@ -630,6 +842,8 @@ export class GapScanner {
       parallaxConf: this.parallax.conf,
       parallaxConfirmed: this.parallaxConfirmed,
       awaitingParallax: this.phase === "tracking" ? awaitingParallax : this.requireParallax && !this.parallaxConfirmed,
+      mode: this.mode,
+      depthCandidates: this.depthCandidates.length,
       hint,
     };
   }
