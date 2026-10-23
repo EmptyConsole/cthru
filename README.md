@@ -1,4 +1,6 @@
-# See Through the Gap
+# cthru
+
+*the gap*
 
 A Next.js web app that finds a narrow **vertical gap** in the camera view (a
 crack between boards, a door left ajar, the space between two shelves) and,
@@ -34,7 +36,9 @@ page.
    quality** shows top-right.
    Nothing is recorded until the quality clears the **recording threshold**
    (default 50%, adjustable, remembered on this device). The REC badge shows
-   when it is recording. If it picks the wrong thing, drag across the gap in
+   when it is recording. Once you've used the camera, it starts by itself the
+   next time you open the page (until you press **Stop** or pick another
+   source). If it picks the wrong thing, drag across the gap in
    the camera view. A gap you pick by hand records whatever its quality.
 3. **Slide** the device sideways, slowly, keeping the same distance. Turning on
    the spot reveals nothing new; the app warns you if you do that. (Optional:
@@ -46,6 +50,7 @@ page.
 You can also open a photo or a recorded video (**Open a photo or video**), or use
 the built-in simulated fence (**Try the demo**). The demo is a flat drawing, which
 a depth model can't judge, so in Depth AI mode it uses the simulator's own depth.
+Nothing is filmed in the demo, so it shows "Stitching the demo" instead of REC.
 For testing, `?photo=<url>` opens a photo directly, e.g.
 `/?photo=/samples/table-gap.jpg`.
 

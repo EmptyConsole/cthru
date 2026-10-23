@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start See Through the Gap without a system-wide Node.js or npm.
+# Start cthru without a system-wide Node.js or npm.
 # The first run downloads a portable Node.js (npm is included) into .local-node/.
 #
 #   ./serve.sh          http://localhost:3000

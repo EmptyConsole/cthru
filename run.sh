@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start See Through the Gap.
+# Start cthru.
 #   ./run.sh          http://localhost:3000
 #   ./run.sh phone    https://<LAN-IP>:3000  (camera on a phone on the same Wi-Fi)
 

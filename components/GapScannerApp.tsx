@@ -31,6 +31,8 @@ const DEPTH_SIZES = [
 ] as const;
 const THEME_KEY = "seethroughgap.theme";
 const ZOOM_KEY = "seethroughgap.zoom";
+/** Set while the camera was the last source chosen, so the next visit starts it straight away. */
+const CAMERA_KEY = "seethroughgap.autoCamera";
 const MIN_ZOOM = 1;
 const MAX_ZOOM = 4;
 
@@ -78,6 +80,14 @@ function loadSetting(key: string): string | null {
 function saveSetting(key: string, value: string) {
   try {
     localStorage.setItem(key, value);
+  } catch {
+    // Not critical.
+  }
+}
+
+function clearSetting(key: string) {
+  try {
+    localStorage.removeItem(key);
   } catch {
     // Not critical.
   }
@@ -361,12 +371,16 @@ export default function GapScannerApp() {
     if (detectorRef.current === "depth") depthRef.current?.start();
   };
 
-  const startCamera = async (deviceId?: string, requestedFacing?: FacingMode) => {
+  /** "superseded" means another source was chosen while the camera was starting. */
+  const startCamera = async (
+    deviceId?: string,
+    requestedFacing?: FacingMode,
+  ): Promise<"started" | "failed" | "superseded"> => {
     stopSource();
     setError(null);
     if (!navigator.mediaDevices?.getUserMedia) {
       setError("This browser can't open the camera here. Camera access needs HTTPS (or localhost).");
-      return;
+      return "failed";
     }
     const facingMode = requestedFacing ?? facingRef.current;
     const gen = cameraGen.current;
@@ -382,7 +396,7 @@ export default function GapScannerApp() {
       });
       if (gen !== cameraGen.current) {
         stream.getTracks().forEach((t) => t.stop());
-        return;
+        return "superseded";
       }
       streamRef.current = stream;
       const v = videoRef.current!;
@@ -391,7 +405,7 @@ export default function GapScannerApp() {
       if (gen !== cameraGen.current) {
         stream.getTracks().forEach((t) => t.stop());
         if (streamRef.current === stream) streamRef.current = null;
-        return;
+        return "superseded";
       }
       const track = stream.getVideoTracks()[0];
       const actual = inferFacing(track, facingMode);
@@ -406,7 +420,7 @@ export default function GapScannerApp() {
       if (gen !== cameraGen.current) {
         stream.getTracks().forEach((t) => t.stop());
         if (streamRef.current === stream) streamRef.current = null;
-        return;
+        return "superseded";
       }
       const options = devices
         .filter((d) => d.kind === "videoinput")
@@ -414,8 +428,10 @@ export default function GapScannerApp() {
       camerasRef.current = options;
       setCameras(options);
       begin("camera");
+      saveSetting(CAMERA_KEY, track.getSettings().deviceId ?? "");
+      return "started";
     } catch (e) {
-      if (gen !== cameraGen.current) return;
+      if (gen !== cameraGen.current) return "superseded";
       streamRef.current?.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
       const name = e instanceof DOMException ? e.name : "";
@@ -426,6 +442,7 @@ export default function GapScannerApp() {
             ? "No camera was found. Try the demo or open a video instead."
             : `Couldn't start the camera${e instanceof Error ? `: ${e.message}` : "."}`,
       );
+      return "failed";
     }
   };
 
@@ -442,7 +459,14 @@ export default function GapScannerApp() {
     }
   };
 
+  /** The user picked something other than the camera, so don't start it on the next visit. */
+  const stopByUser = () => {
+    clearSetting(CAMERA_KEY);
+    stopSource();
+  };
+
   const startDemo = () => {
+    clearSetting(CAMERA_KEY);
     stopSource();
     setError(null);
     simRef.current = new GapSimulator();
@@ -450,6 +474,7 @@ export default function GapScannerApp() {
   };
 
   const startFile = async (file: File) => {
+    clearSetting(CAMERA_KEY);
     stopSource();
     setError(null);
     if (file.type.startsWith("image/")) {
@@ -476,9 +501,29 @@ export default function GapScannerApp() {
   };
 
   // `?photo=<url>` opens a still photo straight away (handy for testing the detector on a shot).
+  // Otherwise, if the camera was the last source used, start it again.
   useEffect(() => {
     const url = new URLSearchParams(window.location.search).get("photo");
-    if (!url) return;
+    if (!url) {
+      const savedId = loadSetting(CAMERA_KEY);
+      if (savedId === null) return;
+      let cancelled = false;
+      void (async () => {
+        try {
+          // Don't pop up a fresh error if the site's camera permission was revoked.
+          const perm = await navigator.permissions?.query({ name: "camera" as PermissionName });
+          if (perm?.state === "denied") return;
+        } catch {
+          // The camera permission can't be queried in every browser; just try.
+        }
+        if (cancelled) return;
+        // The saved camera may be gone (unplugged, IDs reset); fall back to the default one.
+        if ((await startCamera(savedId || undefined)) === "failed" && savedId && !cancelled) await startCamera();
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }
     fetch(url)
       .then((r) => r.blob())
       .then((b) => startFile(new File([b], "photo", { type: b.type || "image/jpeg" })))
@@ -1131,7 +1176,10 @@ export default function GapScannerApp() {
       : !status.scanning
         ? { label: "Paused", cls: "bg-slate-300/90 text-slate-900" }
         : status.recording
-          ? { label: status.forced ? "REC · picked by hand" : "REC", cls: "bg-red-500/90 text-white", rec: true }
+          ? source === "demo"
+            ? // The demo only simulates a camera, so a red REC badge would suggest something is being filmed.
+              { label: "Stitching the demo", cls: "bg-emerald-400/90 text-emerald-950" }
+            : { label: status.forced ? "REC · picked by hand" : "REC", cls: "bg-red-500/90 text-white", rec: true }
           : status.awaitingParallax
             ? { label: "Slide sideways to confirm", cls: "bg-sky-400/90 text-sky-950" }
             : { label: "Waiting for a clearer gap", cls: "bg-amber-400/90 text-amber-950" };
@@ -1157,7 +1205,10 @@ export default function GapScannerApp() {
     >
       <header className="flex items-start justify-between gap-3">
         <div className="flex min-w-0 flex-col gap-1">
-          <h1 className="text-xl font-semibold tracking-tight sm:text-3xl">See Through the Gap</h1>
+          <h1 className="flex items-baseline gap-1.5 sm:gap-2">
+            <span className="text-3xl font-bold tracking-tight sm:text-5xl">cthru</span>
+            <span className="text-sm font-normal text-faint sm:text-lg">the gap</span>
+          </h1>
           <p className="max-w-2xl text-sm text-muted sm:text-base">
             Point your camera at a narrow vertical opening and slide sideways. Once a real gap is detected, each position
             records a slice of what&apos;s behind it into one wide picture.
@@ -1191,7 +1242,7 @@ export default function GapScannerApp() {
           </select>
         )}
         {source !== "none" && (
-          <button onClick={stopSource} className="h-11 touch-manipulation rounded-full px-4 text-sm text-faint hover:text-foreground">
+          <button onClick={stopByUser} className="h-11 touch-manipulation rounded-full px-4 text-sm text-faint hover:text-foreground">
             Stop
           </button>
         )}

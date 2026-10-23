@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "See Through the Gap",
+  title: "cthru the gap",
   description: "Scan through a narrow vertical gap and stitch together a wide picture of what's behind it.",
 };
 
