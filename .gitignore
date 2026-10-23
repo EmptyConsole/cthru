@@ -2,6 +2,7 @@
 
 # dependencies
 /node_modules
+/.local-node
 /.pnp
 .pnp.*
 .yarn/*

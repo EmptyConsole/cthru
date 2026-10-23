@@ -253,7 +253,12 @@ export class GapSimulator {
    * depth mode the demo uses this instead. The fence and everything on it
    * (the poster, the sign) are near; only the slit shows the far scene.
    */
-  depthMap(width: number, height: number): { data: Float32Array; width: number; height: number } {
+  depthMap(
+    width: number,
+    height: number,
+    /** Part of the frame (in frame pixels) the depth map should cover, e.g. when zoomed in. */
+    crop: { sx: number; sy: number; sw: number; sh: number } = { sx: 0, sy: 0, sw: FRAME_W, sh: FRAME_H },
+  ): { data: Float32Array; width: number; height: number } {
     const data = new Float32Array(width * height);
     const slitL = FENCE_W / 2 - SLIT_W / 2;
     const fenceOffset = FENCE_W / 2 - FRAME_W / 2 + this.lastOccShift;
@@ -262,7 +267,7 @@ export class GapSimulator {
       // Supersample each column for soft, model-like boundaries.
       let far = 0;
       for (const sub of [-0.33, 0, 0.33]) {
-        const xf = ((xd + 0.5 + sub) * FRAME_W) / width - 0.5 + fenceOffset;
+        const xf = crop.sx + ((xd + 0.5 + sub) * crop.sw) / width - 0.5 + fenceOffset;
         if (xf >= slitL && xf < slitL + SLIT_W) far += 1 / 3;
       }
       cols[xd] = far;

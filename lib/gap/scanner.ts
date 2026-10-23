@@ -776,6 +776,11 @@ export class GapScanner {
     const [e0, e1] = this.gray.isEmpty ? [0, -1] : this.gray.localExtentX;
     const coverage = gw > 0 && e1 >= e0 ? (e1 - e0 + 1) / gw : 0;
     const rotating = this.framesUsed > 15 && this.absGapMotion > 0.7 && this.absReveal < 0.25 * this.absGapMotion;
+    const gapWidthFrac = this.width > 0 ? gw / this.width : 0;
+    const unstable =
+      this.lostFrames > 0 ||
+      rotating ||
+      (this.phase === "tracking" && this.absGapMotion > 1.1 && Math.abs(this.revealRate) < 0.12);
 
     const pct = (v: number) => `${Math.round(v * 100)}%`;
     const belowThreshold = this.quality < this.threshold;
@@ -844,6 +849,8 @@ export class GapScanner {
       awaitingParallax: this.phase === "tracking" ? awaitingParallax : this.requireParallax && !this.parallaxConfirmed,
       mode: this.mode,
       depthCandidates: this.depthCandidates.length,
+      gapWidthFrac,
+      unstable,
       hint,
     };
   }
