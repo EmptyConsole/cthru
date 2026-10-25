@@ -37,6 +37,16 @@ export class Accumulator {
     this.value = this.channels === 1 ? new Float32Array(this.width * this.height) : null;
   }
 
+  /** An independent copy (e.g. to roll back slices from a gap that turns out not to be one). */
+  clone(): Accumulator {
+    const c = Object.create(Accumulator.prototype) as Accumulator;
+    Object.assign(c, this);
+    c.sum = this.sum.slice();
+    c.weight = this.weight.slice();
+    c.value = this.value ? this.value.slice() : null;
+    return c;
+  }
+
   get isEmpty(): boolean {
     return this.minX > this.maxX;
   }

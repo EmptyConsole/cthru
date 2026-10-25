@@ -1,0 +1,107 @@
+/* Animations for the /test app. Kept here so the shared globals.css stays untouched. */
+
+@keyframes slide {
+  0%,
+  100% {
+    transform: translateX(-14px);
+  }
+  50% {
+    transform: translateX(14px);
+  }
+}
+
+@keyframes reveal {
+  0%,
+  100% {
+    transform: translateX(10px);
+  }
+  50% {
+    transform: translateX(-10px);
+  }
+}
+
+@keyframes aim {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes sheet {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: none;
+  }
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.slide {
+  animation: slide 2.4s ease-in-out infinite;
+}
+
+.reveal {
+  animation: reveal 2.4s ease-in-out infinite;
+}
+
+.aim {
+  animation: aim 1.6s ease-in-out infinite;
+}
+
+.spin {
+  animation: spin 1.1s linear infinite;
+  transform-origin: center;
+}
+
+.rise {
+  animation: rise 0.22s ease-out both;
+}
+
+.sheet {
+  animation: sheet 0.24s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.fade {
+  animation: fade 0.2s ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .slide,
+  .reveal,
+  .aim,
+  .spin,
+  .rise,
+  .sheet,
+  .fade {
+    animation: none;
+  }
+}

@@ -27,6 +27,8 @@ export interface ScannerOptions {
   requireParallax?: boolean;
   /** How the gap is found. Defaults to "edges". */
   mode?: DetectorMode;
+  /** See `GapScanner.parallaxAfterSlide`. Defaults to null (off). */
+  parallaxAfterSlide?: number | null;
 }
 
 /**
@@ -81,6 +83,10 @@ const DEPTH_LOCK_HITS = 3;
 const DEPTH_LOST_AFTER = 4;
 /** Frames of occluder-motion history kept for compensating depth latency. */
 const OCC_HISTORY = 256;
+/** With `parallaxAfterSlide`: drop a gap that has slid this many times that distance without showing parallax. */
+const SLIDE_REJECT_FACTOR = 4;
+/** Frames a rejected gap's place on the occluder is ignored by depth detection. */
+const SUPPRESS_FRAMES = 300;
 
 /** Overlap of two gaps' column ranges, as intersection over union (0..1). */
 function overlap1D(a: Gap, b: Gap): number {
@@ -145,6 +151,17 @@ export class GapScanner {
    * opening from a rectangle on the wall that merely looks like one.
    */
   requireParallax: boolean;
+  /**
+   * Off when null. Otherwise, record a gap straight away (as with
+   * `requireParallax` off) while the device is held still, but once the
+   * occluder has moved this far (analysis px) since locking, keep recording
+   * only if the gap has shown parallax. Sliding is the only time the picture
+   * grows and also when parallax is observable, so this costs little for a
+   * real opening and stops a false detection (e.g. a dark poster a depth
+   * model reads as far) from being recorded across a sweep. A gap that slides
+   * much further without parallax is dropped, and its place ignored for a while.
+   */
+  parallaxAfterSlide: number | null;
   /** The current gap / candidate has shown parallax. */
   parallaxConfirmed = false;
   /** Latest motion analysis (for debugging overlays). */
@@ -197,6 +214,12 @@ export class GapScanner {
   private pendingDepth: DepthSubmission | null = null;
   private depthMisses = 0;
   private lastDepthFrame = -1;
+  /** Total occluder movement (px, either direction) since the current gap was locked. */
+  private travel = 0;
+  /** Rejected gaps' places on the occluder (centre and half-width, in occluder coordinates) and expiry frame. */
+  private suppressed: { centre: number; half: number; until: number }[] = [];
+  /** With `parallaxAfterSlide`: the picture as it was when an unconfirmed gap locked, to roll back if it's rejected. */
+  private rollback: ReturnType<GapScanner["saveMosaic"]> | null = null;
 
   private gray: Accumulator;
   private color: Accumulator;
@@ -226,6 +249,7 @@ export class GapScanner {
     this.threshold = opts.threshold ?? DEFAULT_THRESHOLD;
     this.requireParallax = opts.requireParallax ?? true;
     this.mode = opts.mode ?? "edges";
+    this.parallaxAfterSlide = opts.parallaxAfterSlide ?? null;
     this.motionEst = new MotionEstimator(opts.width, opts.height);
     this.motionMap = { evidence: new Float32Array(opts.width), confidence: new Float32Array(opts.width) };
     this.gray = this.makeGray();
@@ -279,6 +303,7 @@ export class GapScanner {
   }
 
   resetMosaic() {
+    this.rollback = null;
     this.gray = this.makeGray();
     this.color = this.makeColor();
     this.posValid = false;
@@ -311,7 +336,39 @@ export class GapScanner {
     this.lostFrames = 0;
     this.depthMisses = 0;
     this.prevGapMid = null;
+    this.travel = 0;
+    this.rollback = this.parallaxAfterSlide !== null && !forced && !this.parallaxConfirmed ? this.saveMosaic() : null;
     if (!this.gray.isEmpty) this.needGlobal = true;
+  }
+
+  private saveMosaic() {
+    return {
+      gray: this.gray.clone(),
+      color: this.color.clone(),
+      pos: { ...this.pos },
+      posValid: this.posValid,
+      vel: this.vel,
+      matchScore: this.matchScore,
+      framesUsed: this.framesUsed,
+    };
+  }
+
+  private restoreMosaic(m: NonNullable<GapScanner["rollback"]>) {
+    this.gray = m.gray;
+    this.color = m.color;
+    this.pos = m.pos;
+    this.posValid = m.posValid;
+    this.vel = m.vel;
+    this.matchScore = m.matchScore;
+    this.framesUsed = m.framesUsed;
+    this.regFails = 0;
+    this.settle = 0;
+  }
+
+  /** The gap has slid far enough that it must show parallax to keep recording (see `parallaxAfterSlide`). */
+  private get slideHold() {
+    const s = this.parallaxAfterSlide;
+    return s !== null && !this.forced && !this.parallaxConfirmed && this.travel > s;
   }
 
   private startRecording() {
@@ -323,7 +380,8 @@ export class GapScanner {
 
   /** Besides quality: has the gap shown parallax (if that's required)? */
   private get recordingAllowed() {
-    return !this.requireParallax || this.parallaxConfirmed;
+    if (this.requireParallax) return this.parallaxConfirmed;
+    return !this.slideHold;
   }
 
   /** Recording gate with hysteresis, so a borderline gap doesn't flicker on and off. */
@@ -342,6 +400,22 @@ export class GapScanner {
     } else {
       this.aboveStreak = q >= this.threshold ? this.aboveStreak + 1 : 0;
       if (this.aboveStreak >= ARM_FRAMES && this.recordingAllowed) this.startRecording();
+    }
+    // Slid a long way and never moved differently from the occluder: it's on the occluder, not a gap.
+    const s = this.parallaxAfterSlide;
+    if (s !== null && this.slideHold && this.travel > SLIDE_REJECT_FACTOR * s && this.gap) {
+      const g = this.gap;
+      this.suppressed.push({
+        centre: (g.left + g.right) / 2 - this.occCum,
+        half: (g.right - g.left) / 2 + 4,
+        until: this.frameIndex + SUPPRESS_FRAMES,
+      });
+      // Take back the slices it added: they show the occluder, and would stop the real view from matching.
+      if (this.rollback) this.restoreMosaic(this.rollback);
+      this.rollback = null;
+      this.unlock();
+      this.rejected = true;
+      return;
     }
     // A gap that never gets good enough is probably not a real gap: look for another.
     this.weakFrames = !this.recording && q < this.threshold ? this.weakFrames + 1 : 0;
@@ -420,7 +494,10 @@ export class GapScanner {
     this.parallax = pm;
     if (!this.parallaxConfirmed) {
       this.confirmStreak = pm.conf >= CONFIRM_CONF && pm.score >= CONFIRM_SCORE ? this.confirmStreak + 1 : 0;
-      if (this.confirmStreak >= CONFIRM_FRAMES) this.parallaxConfirmed = true;
+      if (this.confirmStreak >= CONFIRM_FRAMES) {
+        this.parallaxConfirmed = true;
+        this.rollback = null;
+      }
     } else {
       // Strong evidence that it doesn't move differently after all.
       this.refuteStreak = pm.conf >= 0.5 && pm.score < 0.05 ? this.refuteStreak + 1 : 0;
@@ -465,6 +542,7 @@ export class GapScanner {
     this.updateMotion(frame);
     this.occCum += this.occluderShift;
     this.occHistory[this.frameIndex % OCC_HISTORY] = this.occCum;
+    if (this.phase === "tracking") this.travel += Math.abs(this.occluderShift);
     if (this.mode === "depth") {
       this.processDepthFrame(frame, getColorStrip);
       return;
@@ -547,9 +625,12 @@ export class GapScanner {
       // Sharpen each side onto a strong image edge just inside it (inward only).
       const r = refineGapEdges(box, profile.coherence, 4);
       if (r.right - r.left < 3 || r.left < 0.5 || r.right > this.width - 1.5) continue;
+      const mid = (r.left + r.right) / 2 - this.occCum;
+      if (this.suppressed.some((z) => z.until > this.frameIndex && Math.abs(mid - z.centre) < z.half)) continue;
       cands.push({ ...r, quality: d.quality });
     }
     this.depthCandidates = cands;
+    this.suppressed = this.suppressed.filter((z) => z.until > this.frameIndex);
 
     if (this.phase === "searching") {
       const prev = this.candidate;
@@ -784,7 +865,7 @@ export class GapScanner {
 
     const pct = (v: number) => `${Math.round(v * 100)}%`;
     const belowThreshold = this.quality < this.threshold;
-    const awaitingParallax = !this.forced && this.requireParallax && !this.parallaxConfirmed;
+    const awaitingParallax = (!this.forced && this.requireParallax && !this.parallaxConfirmed) || this.slideHold;
     let hint: string;
     if (this.phase === "searching") {
       if (this.mode === "depth" && this.lastDepthFrame < 0) {

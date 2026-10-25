@@ -8,8 +8,14 @@ import { crop, depthWorld, pose, renderWorld, toRGBA, W, H, type WorldOptions } 
  * computed from frame `t - lag` and handed over only every `every` frames,
  * like a real depth worker running behind the camera.
  */
-function run(world: WorldOptions, frames: number, { lag = 5, every = 4, start = 0 } = {}) {
-  const scanner = new GapScanner({ width: W, height: H, colorScale: 1, mode: "depth", requireParallax: false });
+function run(
+  world: WorldOptions,
+  frames: number,
+  { lag = 5, every = 4, start = 0, depthLies = [] as { offset: number; width: number }[], parallaxAfterSlide = null as number | null } = {},
+) {
+  const scanner = new GapScanner({ width: W, height: H, colorScale: 1, mode: "depth", requireParallax: false, parallaxAfterSlide });
+  // What the depth model reports: the real openings, plus anything it wrongly reads as far.
+  const depthView: WorldOptions = { ...world, slits: [...(world.slits ?? []), ...depthLies] };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const I = scanner as any;
   const log: { t: number; box: { left: number; right: number } | null; recorded: boolean; occ: number }[] = [];
@@ -20,7 +26,7 @@ function run(world: WorldOptions, frames: number, { lag = 5, every = 4, start = 
     const rgba = toRGBA(frame);
     const src = t - lag;
     if ((t - start) % every === 0 && frameIdAt.has(src)) {
-      const d = depthWorld(pose(src), world, 224, 168, src);
+      const d = depthWorld(pose(src), depthView, 224, 168, src);
       scanner.submitDepth({ frameId: frameIdAt.get(src)!, width: d.width, height: d.height, gaps: findDepthGaps(d).gaps });
     }
     const before = I.framesUsed;
@@ -83,6 +89,27 @@ describe("GapScanner in depth mode", () => {
       scanner.processFrame(f, (a, b) => crop(toRGBA(f), a, b));
     }
     expect(scanner.phase).toBe("searching");
+  });
+
+  it("with parallaxAfterSlide, drops a poster the depth model misreads as far, takes back its slices, and records the real opening", () => {
+    const world = { slits: [OPENING], objects: [POSTER] };
+    const opts = { depthLies: [POSTER] };
+    const near = (b: { left: number; right: number } | null, o: { offset: number }) => b !== null && Math.abs((b.left + b.right) / 2 - o.offset) < 8;
+    // Without it, the misread poster is recorded across the whole sweep.
+    const plain = run(world, 240, opts).log;
+    expect(plain.filter((l) => l.recorded && near(l.box, POSTER)).length).toBeGreaterThan(150);
+    const { scanner, log } = run(world, 240, { ...opts, parallaxAfterSlide: 8 });
+    expect(log.filter((l) => l.recorded && near(l.box, POSTER)).length).toBeLessThan(25);
+    expect(log.filter((l) => l.recorded && near(l.box, OPENING)).length).toBeGreaterThan(80);
+    expect(near(log[log.length - 1].box, OPENING)).toBe(true);
+    // The picture holds only what was recorded through the real opening.
+    const used = log.filter((l) => l.recorded && near(l.box, OPENING)).length;
+    expect(scanner.getStatus().framesUsed).toBeLessThanOrEqual(used);
+  });
+
+  it("with parallaxAfterSlide, still records a real opening held still", () => {
+    const { log } = run({ slits: [{ offset: 0, width: 36 }] }, 80, { parallaxAfterSlide: 8 });
+    expect(log.filter((l) => l.recorded).length).toBeGreaterThan(50);
   });
 
   it("stitches the hidden scene correctly while driven by depth", () => {
