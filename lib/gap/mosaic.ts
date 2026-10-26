@@ -37,14 +37,73 @@ export class Accumulator {
     this.value = this.channels === 1 ? new Float32Array(this.width * this.height) : null;
   }
 
-  /** An independent copy (e.g. to roll back slices from a gap that turns out not to be one). */
-  clone(): Accumulator {
-    const c = Object.create(Accumulator.prototype) as Accumulator;
-    Object.assign(c, this);
-    c.sum = this.sum.slice();
-    c.weight = this.weight.slice();
-    c.value = this.value ? this.value.slice() : null;
-    return c;
+  /**
+   * Undo log (see `beginUndo`): each column's contents the first time it is
+   * painted, by local column, plus the painted bounding box at the start.
+   */
+  private undo: {
+    cols: Map<number, { sum: Float32Array; weight: Float32Array; value: Float32Array | null }>;
+    box: [number, number, number, number];
+  } | null = null;
+
+  /**
+   * Start recording what painting changes, so `rollbackUndo` can take it back
+   * (e.g. slices from a gap that turns out not to be one). Only columns that
+   * get painted are saved, once each, so this costs a strip's worth of memory,
+   * not a copy of the whole picture.
+   */
+  beginUndo(): void {
+    this.undo = { cols: new Map(), box: [this.minX - this.originX, this.maxX - this.originX, this.minY, this.maxY] };
+  }
+
+  /** Stop recording and forget the saved columns (keep what was painted). */
+  endUndo(): void {
+    this.undo = null;
+  }
+
+  /** Restore every column painted since `beginUndo`, and stop recording. */
+  rollbackUndo(): void {
+    const u = this.undo;
+    this.undo = null;
+    if (!u) return;
+    const W = this.width;
+    const ch = this.channels;
+    for (const [local, c] of u.cols) {
+      const X = local + this.originX;
+      for (let y = 0; y < this.height; y++) {
+        const idx = y * W + X;
+        this.weight[idx] = c.weight[y];
+        for (let k = 0; k < ch; k++) this.sum[idx * ch + k] = c.sum[y * ch + k];
+        if (this.value && c.value) this.value[idx] = c.value[y];
+      }
+    }
+    const [x0, x1, y0, y1] = u.box;
+    this.minX = x0 + this.originX;
+    this.maxX = x1 + this.originX;
+    this.minY = y0;
+    this.maxY = y1;
+  }
+
+  /** Save local columns [u0, u1] to the undo log (those not saved yet). */
+  private saveUndo(u0: number, u1: number) {
+    const u = this.undo!;
+    const W = this.width;
+    const H = this.height;
+    const ch = this.channels;
+    for (let local = u0; local <= u1; local++) {
+      if (u.cols.has(local)) continue;
+      const X = local + this.originX;
+      const sum = new Float32Array(H * ch);
+      const weight = new Float32Array(H);
+      const value = this.value ? new Float32Array(H) : null;
+      for (let y = 0; y < H; y++) {
+        const idx = y * W + X;
+        weight[y] = this.weight[idx];
+        for (let k = 0; k < ch; k++) sum[y * ch + k] = this.sum[idx * ch + k];
+        if (value) value[y] = this.value![idx];
+      }
+      u.cols.set(local, { sum, weight, value });
+    }
   }
 
   get isEmpty(): boolean {
@@ -115,6 +174,7 @@ export class Accumulator {
     const u0 = Math.ceil(srcX0 + offX);
     const u1 = Math.floor(srcX1 - 1 + offX);
     this.ensure(u0, u1);
+    if (this.undo) this.saveUndo(u0, u1);
     const W = this.width;
     const ox = this.originX;
     const oy = this.originY;
@@ -179,14 +239,19 @@ export class Accumulator {
     if (u1 + ox > this.maxX) this.maxX = u1 + ox;
   }
 
-  /** Render the painted bounding box to RGBA. Unpainted pixels are transparent. */
-  toRGBA(): { data: Uint8ClampedArray; width: number; height: number; x0: number; y0: number } | null {
+  /**
+   * Render the painted bounding box to RGBA. Unpainted pixels are transparent.
+   * Pass the previous result's `data` as `reuse` to avoid allocating a new
+   * buffer when the size hasn't changed (callers that redraw often).
+   */
+  toRGBA(reuse?: Uint8ClampedArray): { data: Uint8ClampedArray; width: number; height: number; x0: number; y0: number } | null {
     if (this.isEmpty) return null;
     const x0 = this.minX;
     const y0 = this.minY;
     const w = this.maxX - this.minX + 1;
     const h = this.maxY - this.minY + 1;
-    const out = new Uint8ClampedArray(w * h * 4);
+    const out = reuse && reuse.length === w * h * 4 ? reuse : new Uint8ClampedArray(w * h * 4);
+    if (out === reuse) out.fill(0);
     const ch = this.channels;
     for (let y = 0; y < h; y++) {
       const srcRow = (y + y0) * this.width + x0;

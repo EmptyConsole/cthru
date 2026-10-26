@@ -127,10 +127,14 @@ export function drawOverlay(ov: HTMLCanvasElement, scanner: GapScanner, x: Overl
  * Copies the scanner's picture into `target` (full resolution). Returns where
  * the current gap strip sits in it, or null if there's no picture yet.
  */
+/** The last RGBA buffer used for each picture canvas, reused so redrawing the preview doesn't allocate. */
+const rgbaBuffers = new WeakMap<HTMLCanvasElement, Uint8ClampedArray>();
+
 export function renderMosaic(target: HTMLCanvasElement, scanner: GapScanner) {
-  const view = scanner.getMosaicView();
+  const view = scanner.getMosaicView(rgbaBuffers.get(target));
   if (!view) return null;
   const { image } = view;
+  rgbaBuffers.set(target, image.data);
   if (target.width !== image.width || target.height !== image.height) {
     target.width = image.width;
     target.height = image.height;

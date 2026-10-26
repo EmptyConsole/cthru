@@ -105,7 +105,48 @@ describe("GapScanner in depth mode", () => {
     // The picture holds only what was recorded through the real opening.
     const used = log.filter((l) => l.recorded && near(l.box, OPENING)).length;
     expect(scanner.getStatus().framesUsed).toBeLessThanOrEqual(used);
-  });
+    // Two full sweeps: give it longer than the default 5 s.
+  }, 20000);
+
+  it("with parallaxAfterSlide, keeps a real opening through long sweeps, even when its parallax is briefly refuted", () => {
+    const scanner = new GapScanner({ width: W, height: H, colorScale: 1, mode: "depth", requireParallax: false, parallaxAfterSlide: 8 });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const I = scanner as any;
+    const world = { slits: [{ offset: 0, width: 36 }] };
+    const frameIdAt = new Map<number, number>();
+    let refuted = 0;
+    let recorded = 0;
+    for (let t = 0; t < 720; t++) {
+      // Slow sweeps with long pauses at each end, where the view stops shifting.
+      const u = Math.max(-1, Math.min(1, 1.6 * Math.sin((t / 180) * Math.PI)));
+      const T = 140 * u;
+      const p = { occShift: 0.2 * T, bgShift: 0.3 * T - 0.8 * T, dy: 1.5 * Math.sin(t * 0.21) };
+      if (t % 4 === 0 && frameIdAt.has(t - 5)) {
+        const src = t - 5;
+        const us = Math.max(-1, Math.min(1, 1.6 * Math.sin((src / 180) * Math.PI)));
+        const Ts = 140 * us;
+        const d = depthWorld({ occShift: 0.2 * Ts, bgShift: 0, dy: 0 }, world, 224, 168, src);
+        scanner.submitDepth({ frameId: frameIdAt.get(src)!, width: d.width, height: d.height, gaps: findDepthGaps(d).gaps });
+      }
+      const frame = renderWorld(p, { ...world, t, noiseAmp: 6 });
+      const rgba = toRGBA(frame);
+      const before = I.framesUsed;
+      scanner.processFrame(frame, (a, b) => crop(rgba, a, b));
+      frameIdAt.set(t, scanner.frameIndex);
+      if (I.framesUsed > before) recorded++;
+      // What the scanner's refute rule does when the view stops shifting for a while (as at the
+      // end of a real sweep): forget that the gap showed parallax.
+      if (t % 60 === 0 && I.parallaxConfirmed) {
+        I.resetParallax();
+        refuted++;
+      }
+    }
+    expect(refuted).toBeGreaterThan(3);
+    // The gap is never dropped, and nearly every frame after locking is recorded.
+    expect(scanner.phase).toBe("tracking");
+    expect(scanner.recordStarts).toBe(1);
+    expect(recorded).toBeGreaterThan(600);
+  }, 20000);
 
   it("with parallaxAfterSlide, still records a real opening held still", () => {
     const { log } = run({ slits: [{ offset: 0, width: 36 }] }, 80, { parallaxAfterSlide: 8 });

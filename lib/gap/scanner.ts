@@ -218,8 +218,14 @@ export class GapScanner {
   private travel = 0;
   /** Rejected gaps' places on the occluder (centre and half-width, in occluder coordinates) and expiry frame. */
   private suppressed: { centre: number; half: number; until: number }[] = [];
-  /** With `parallaxAfterSlide`: the picture as it was when an unconfirmed gap locked, to roll back if it's rejected. */
-  private rollback: ReturnType<GapScanner["saveMosaic"]> | null = null;
+  /** With `parallaxAfterSlide`: the picture's state when an unconfirmed gap locked, to roll back if it's rejected. */
+  private rollback: { pos: { x: number; y: number }; posValid: boolean; vel: number; matchScore: number | null; framesUsed: number } | null = null;
+  /**
+   * The current gap has shown parallax at some point since it locked. Parallax
+   * can be "refuted" again later (e.g. while pausing at the end of a sweep);
+   * that mustn't make the slide check drop a gap that already proved itself.
+   */
+  private everConfirmed = false;
 
   private gray: Accumulator;
   private color: Accumulator;
@@ -303,7 +309,7 @@ export class GapScanner {
   }
 
   resetMosaic() {
-    this.rollback = null;
+    this.endRollback();
     this.gray = this.makeGray();
     this.color = this.makeColor();
     this.posValid = false;
@@ -337,25 +343,29 @@ export class GapScanner {
     this.depthMisses = 0;
     this.prevGapMid = null;
     this.travel = 0;
-    this.rollback = this.parallaxAfterSlide !== null && !forced && !this.parallaxConfirmed ? this.saveMosaic() : null;
+    this.everConfirmed = this.parallaxConfirmed;
+    this.endRollback();
+    if (this.parallaxAfterSlide !== null && !forced && !this.parallaxConfirmed) {
+      this.rollback = { pos: { ...this.pos }, posValid: this.posValid, vel: this.vel, matchScore: this.matchScore, framesUsed: this.framesUsed };
+      this.gray.beginUndo();
+      this.color.beginUndo();
+    }
     if (!this.gray.isEmpty) this.needGlobal = true;
   }
 
-  private saveMosaic() {
-    return {
-      gray: this.gray.clone(),
-      color: this.color.clone(),
-      pos: { ...this.pos },
-      posValid: this.posValid,
-      vel: this.vel,
-      matchScore: this.matchScore,
-      framesUsed: this.framesUsed,
-    };
+  /** Keep what the current gap painted: it's confirmed, or the picture was reset. */
+  private endRollback() {
+    this.rollback = null;
+    this.gray.endUndo();
+    this.color.endUndo();
   }
 
-  private restoreMosaic(m: NonNullable<GapScanner["rollback"]>) {
-    this.gray = m.gray;
-    this.color = m.color;
+  /** Take back everything painted since the current gap locked. */
+  private rollbackMosaic() {
+    const m = this.rollback;
+    if (!m) return;
+    this.gray.rollbackUndo();
+    this.color.rollbackUndo();
     this.pos = m.pos;
     this.posValid = m.posValid;
     this.vel = m.vel;
@@ -363,12 +373,13 @@ export class GapScanner {
     this.framesUsed = m.framesUsed;
     this.regFails = 0;
     this.settle = 0;
+    this.rollback = null;
   }
 
   /** The gap has slid far enough that it must show parallax to keep recording (see `parallaxAfterSlide`). */
   private get slideHold() {
     const s = this.parallaxAfterSlide;
-    return s !== null && !this.forced && !this.parallaxConfirmed && this.travel > s;
+    return s !== null && !this.forced && !this.everConfirmed && !this.parallaxConfirmed && this.travel > s;
   }
 
   private startRecording() {
@@ -411,8 +422,7 @@ export class GapScanner {
         until: this.frameIndex + SUPPRESS_FRAMES,
       });
       // Take back the slices it added: they show the occluder, and would stop the real view from matching.
-      if (this.rollback) this.restoreMosaic(this.rollback);
-      this.rollback = null;
+      this.rollbackMosaic();
       this.unlock();
       this.rejected = true;
       return;
@@ -496,7 +506,10 @@ export class GapScanner {
       this.confirmStreak = pm.conf >= CONFIRM_CONF && pm.score >= CONFIRM_SCORE ? this.confirmStreak + 1 : 0;
       if (this.confirmStreak >= CONFIRM_FRAMES) {
         this.parallaxConfirmed = true;
-        this.rollback = null;
+        if (this.phase === "tracking") {
+          this.everConfirmed = true;
+          this.endRollback();
+        }
       }
     } else {
       // Strong evidence that it doesn't move differently after all.
@@ -840,8 +853,9 @@ export class GapScanner {
     this.framesUsed++;
   }
 
-  getMosaicView(): MosaicView | null {
-    const img = this.color.toRGBA();
+  /** `reuse`: the previous view's `image.data`, to redraw without allocating (see `Accumulator.toRGBA`). */
+  getMosaicView(reuse?: Uint8ClampedArray): MosaicView | null {
+    const img = this.color.toRGBA(reuse);
     if (!img) return null;
     let win: MosaicView["window"] = null;
     if (this.lastStrip && this.posValid && this.phase === "tracking") {
