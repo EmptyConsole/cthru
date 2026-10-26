@@ -34,10 +34,30 @@ async function pickWebGPU(): Promise<{ dtype: "fp16" | "fp32" } | null> {
   }
 }
 
-async function load(preferGPU: boolean) {
+async function load(preferGPU: boolean, safeWasm = false) {
   const progress = (p: ProgressInfo) => {
     if (p.status === "progress_total") post({ type: "progress", loaded: p.loaded, total: p.total });
   };
+  if (safeWasm) {
+    // Transformers.js would load the asyncify build on Safari 26, which grows
+    // memory while WebKit compiles it (microsoft/onnxruntime#26827); the plain
+    // build is the one reported stable there. One thread: Safari can't start
+    // workers inside a worker, and the static site isn't cross-origin isolated.
+    const wasm = env.backends.onnx.wasm!;
+    const base = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${env.backends.onnx.versions?.web}/dist/`;
+    wasm.wasmPaths = { mjs: `${base}ort-wasm-simd-threaded.mjs`, wasm: `${base}ort-wasm-simd-threaded.wasm` };
+    wasm.numThreads = 1;
+    model = await AutoModel.from_pretrained(MODEL_ID, {
+      device: "wasm",
+      dtype: "q8",
+      progress_callback: progress,
+      // The WASM heap never shrinks: don't let the arena and memory patterns grow it further.
+      session_options: { enableCpuMemArena: false, enableMemPattern: false },
+    });
+    await warmUp();
+    post({ type: "ready", device: "wasm", dtype: "q8" });
+    return;
+  }
   const gpu = preferGPU ? await pickWebGPU() : null;
   if (gpu) {
     try {
@@ -106,7 +126,7 @@ async function infer(req: Extract<DepthWorkerRequest, { type: "infer" }>) {
 self.onmessage = async (e: MessageEvent<DepthWorkerRequest>) => {
   const msg = e.data;
   try {
-    if (msg.type === "init") await load(msg.preferGPU);
+    if (msg.type === "init") await load(msg.preferGPU, msg.safeWasm);
     else if (msg.type === "infer") {
       if (!model) throw new Error("Depth model not loaded");
       await infer(msg);

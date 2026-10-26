@@ -43,6 +43,19 @@ export interface CueTiming {
   recordingFor: number;
 }
 
+/**
+ * Safari (every iOS browser is Safari underneath) runs the depth model on the
+ * CPU with ONNX Runtime's plain WebAssembly build: its GPU path and the default
+ * builds grow memory until iOS kills the tab. `?depth=safe` forces it elsewhere, for testing.
+ */
+function needsSafeDepth(): boolean {
+  if (new URLSearchParams(window.location.search).get("depth") === "safe") return true;
+  const ua = navigator.userAgent;
+  const iOS = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+  const safari = /AppleWebKit/.test(ua) && !/Chrome|Chromium|Edg|OPR|Android/.test(ua);
+  return iOS || safari;
+}
+
 function clamp(v: number, lo: number, hi: number) {
   return Math.min(hi, Math.max(lo, v));
 }
@@ -153,7 +166,7 @@ export function useScanEngine(settings: Settings, { videoRef, viewRef, overlayRe
       sc.mode = detector;
       sc.unlock();
     }
-    if (detector === "depth" && source !== "none") depthRef.current?.start();
+    if (detector === "depth" && source !== "none") depthRef.current?.start(true, needsSafeDepth());
   }, [detector, source]);
   useEffect(() => {
     if (scannerRef.current) scannerRef.current.requireParallax = requireParallax;
@@ -252,7 +265,7 @@ export function useScanEngine(settings: Settings, { videoRef, viewRef, overlayRe
   const begin = (kind: SourceKind) => {
     setSource(kind);
     setSession((s) => s + 1);
-    if (detectorRef.current === "depth") depthRef.current?.start();
+    if (detectorRef.current === "depth") depthRef.current?.start(true, needsSafeDepth());
   };
 
   const startCamera = async (deviceId?: string, requestedFacing?: FacingMode): Promise<StartResult> => {

@@ -2,7 +2,16 @@ import type { DepthGap } from "../gap/depthGap";
 
 /** Messages to the depth worker. */
 export type DepthWorkerRequest =
-  | { type: "init"; preferGPU: boolean }
+  | {
+      type: "init";
+      preferGPU: boolean;
+      /**
+       * Run on the CPU with ONNX Runtime's plain WebAssembly build (8-bit model,
+       * one thread, no memory arena). For Safari: the asyncify / JSEP builds and
+       * WebGPU grow memory until iOS kills the tab. Defaults to false.
+       */
+      safeWasm?: boolean;
+    }
   | {
       type: "infer";
       id: number;

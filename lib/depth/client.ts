@@ -46,14 +46,14 @@ export class DepthClient {
     return this.status.state === "ready";
   }
 
-  /** Start loading the model (no-op if already started). */
-  start(preferGPU = true) {
+  /** Start loading the model (no-op if already started). See the worker's `safeWasm` for `safeWasm`. */
+  start(preferGPU = true, safeWasm = false) {
     if (this.worker) return;
     this.setStatus({ state: "loading", progress: 0, error: undefined });
     this.worker = new Worker(new URL("./depthWorker.ts", import.meta.url), { type: "module" });
     this.worker.onmessage = (e: MessageEvent<DepthWorkerResponse>) => this.handle(e.data);
     this.worker.onerror = (e) => this.setStatus({ state: "error", error: e.message || "Depth worker failed to start" });
-    this.send({ type: "init", preferGPU });
+    this.send({ type: "init", preferGPU, safeWasm });
   }
 
   /**
